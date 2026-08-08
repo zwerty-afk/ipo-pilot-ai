@@ -83,9 +83,13 @@ export default function IpoReadinessPage() {
   useEffect(() => {
     loadData();
     const handleUpdate = () => loadData();
+    window.addEventListener('ipo-readiness-changed', handleUpdate);
     window.addEventListener('ipo-company-changed', handleUpdate);
+    window.addEventListener('storage', handleUpdate);
     return () => {
+      window.removeEventListener('ipo-readiness-changed', handleUpdate);
       window.removeEventListener('ipo-company-changed', handleUpdate);
+      window.removeEventListener('storage', handleUpdate);
     };
   }, [companyId]);
 
