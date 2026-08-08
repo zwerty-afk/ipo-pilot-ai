@@ -3363,10 +3363,6 @@ export default async function handler(req, res) {
     console.error('Storage init failed:', err);
     res.statusCode = 503;
     res.setHeader('Content-Type', 'application/json');
-    // The bare "Storage unavailable" message left no way to tell a missing table
-    // from a bad region from a denied IAM policy without digging through Vercel's
-    // function logs. AWS error names/codes are classifications, not secrets, so
-    // returning them is safe and turns a dead end into an actionable message.
     return res.end(JSON.stringify({
       message: 'Storage unavailable. Please retry.',
       reason: err?.name || 'UnknownError',
@@ -3374,6 +3370,20 @@ export default async function handler(req, res) {
       hint: 'Check /api/health for which storage settings resolved.'
     }));
   }
+
+  // Intercept response finish in serverless mode to ensure pending DB writes flush to DynamoDB before container freezes
+  const originalEnd = res.end;
+  let flushed = false;
+  res.end = function (...args) {
+    if (flushed) return originalEnd.apply(res, args);
+    flushed = true;
+    flushDb()
+      .catch((err) => console.error('[serverless] flushDb error:', err))
+      .finally(() => {
+        originalEnd.apply(res, args);
+      });
+  };
+
   return app(req, res);
 }
 
