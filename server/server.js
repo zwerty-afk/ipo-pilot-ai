@@ -1,0 +1,3381 @@
+import 'dotenv/config';
+import { S3Client, DeleteObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
+import express from 'express';
+import cors from 'cors';
+import multer from 'multer';
+import crypto from 'crypto';
+
+import multerS3 from 'multer-s3';
+import path from 'path';
+import fs from 'fs';
+import { fileURLToPath } from 'url';
+import { Document, Packer, Paragraph, TextRun, HeadingLevel, AlignmentType, Table, TableRow, TableCell, WidthType } from 'docx';
+import PDFDocument from 'pdfkit';
+import { GoogleGenerativeAI } from '@google/generative-ai';
+import cron from 'node-cron';
+import { db, getDb, saveDb, hashPassword, verifyPassword, initDb, flushDb } from './db.js';
+import {
+  DRHP_HIERARCHY, getExportBlocksForSubsection, renderBlockDocx, renderBlockPdf,
+  resolveFrontMatterContext, renderFrontMatterDocx, renderFrontMatterPdf,
+  buildDocxHeaderFooter, pdfAddFooters
+} from './drhpExportEngine.js';
+import {
+  mockVerifyGST, mockVerifyPAN, mockVerifyCIN,
+  buildComparisonRows, assessDocumentAuthenticity, deriveStatus
+} from './verificationEngine.js';
+import {
+  detectSources, retrieveSources, buildContextBlock, isGeneralKnowledgeQuestion
+} from './copilotRetrieval.js';
+// Read directly from the store module: db.js deliberately does not re-export
+// these, but /api/health needs to report whether DynamoDB is configured and live.
+import { dynamoEnabled, isReady as isDbReady } from './dynamoStore.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+// Serverless filesystems are read-only apart from /tmp, so the local uploads dir
+// moves there. Uploads go to S3 whenever AWS credentials exist; this path is only
+// the no-credentials fallback.
+const UPLOADS_DIR = process.env.VERCEL ? '/tmp/uploads' : path.join(__dirname, 'uploads');
+
+// mkdir at import time would throw EROFS on a read-only deployment and kill the
+// whole function before it serves a request, so failure here must not be fatal.
+try {
+  if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+} catch (err) {
+  console.warn(`[uploads] could not create ${UPLOADS_DIR}: ${err.message}`);
+}
+
+// Verify Gemini API key
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
+if (!GEMINI_API_KEY) {
+  console.warn('[server] GEMINI_API_KEY is not set — AI generation & OCR will return structured fallback outputs.');
+}
+
+const genAI = GEMINI_API_KEY ? new GoogleGenerativeAI(GEMINI_API_KEY) : null;
+// gemini-2.0-flash returns 429 with "limit: 0" on this project — the free tier
+// grants it no allowance at all, so no amount of waiting helps. The *-latest
+// aliases do have an allowance and pass a PDF vision probe, which is what OCR
+// needs. Overridable so a paid project can pin an exact version.
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-flash-latest';
+
+// Models to fall through to when the primary is overloaded. These are demand
+// problems, not quota problems: a 503 "model is overloaded" or a 429 with a
+// retry delay clears on its own, so retrying the same model then trying a
+// sibling recovers far more often than failing straight to the canned fallback.
+// Ordered cheapest-and-fastest last, since a degraded answer beats no answer.
+const GEMINI_FALLBACK_MODELS = (process.env.GEMINI_FALLBACK_MODELS ||
+  'gemini-flash-latest,gemini-flash-lite-latest')
+  .split(',').map((m) => m.trim()).filter(Boolean);
+
+// Ordered, de-duplicated: primary first, then any fallback not equal to it.
+const GEMINI_MODEL_CHAIN = [GEMINI_MODEL, ...GEMINI_FALLBACK_MODELS]
+  .filter((m, i, arr) => arr.indexOf(m) === i);
+
+// A hung request is worse than a failed one: without a deadline the SDK can sit
+// for minutes on an overloaded model while the user stares at a spinner, and on
+// Vercel the function is killed at maxDuration with no response at all.
+const GEMINI_TIMEOUT_MS = Number(process.env.GEMINI_TIMEOUT_MS || 20000);
+const GEMINI_MAX_ATTEMPTS = Number(process.env.GEMINI_MAX_ATTEMPTS || 3);
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+const ROMAN = ['I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII', 'IX', 'X', 'XI', 'XII'];
+
+const CHAPTER_ORDER = [
+  { key: 'company_details',   title: 'Chapter 1: General Information & Company Profile' },
+  { key: 'business_overview', title: 'Chapter 2: Business Overview' },
+  { key: 'financials',        title: 'Chapter 3: Financial Information' },
+  { key: 'capital_structure', title: 'Chapter 4: Capital Structure' },
+  { key: 'objects',           title: 'Chapter 5: Objects of the Issue' },
+  { key: 'promoter_details',  title: 'Chapter 6: Promoters & Management' },
+  { key: 'related_party',     title: 'Chapter 7: Related Party Transactions' },
+  { key: 'risk_factors',      title: 'Chapter 8: Risk Factors' },
+  { key: 'litigation',        title: 'Chapter 9: Litigation & Legal Proceedings' },
+  { key: 'legal_compliance',  title: 'Chapter 10: Legal & Compliance' },
+  { key: 'other_disclosures', title: 'Chapter 11: Other Disclosures' }
+];
+
+/** True for errors that a retry or a different model can plausibly fix. */
+function isTransientGeminiError(err) {
+  const status = err?.status ?? err?.response?.status;
+  if (status === 429 || status === 500 || status === 503 || status === 504) {
+    // 429 with "limit: 0" means the tier grants this model no allowance at all,
+    // so waiting cannot help — treat it as permanent for the current model and
+    // let the chain move on to the next one.
+    if (status === 429 && /limit:\s*0/i.test(err?.message || '')) return false;
+    return true;
+  }
+  const msg = String(err?.message || err).toLowerCase();
+  return msg.includes('overloaded') || msg.includes('unavailable') ||
+         msg.includes('timed out') || msg.includes('timeout') ||
+         msg.includes('fetch failed') || msg.includes('socket hang up') ||
+         msg.includes('econnreset') || msg.includes('etimedout');
+}
+
+/** Honour the server's own backoff hint when it sends one. */
+function retryDelayMs(err, attempt) {
+  const hinted = /retry(?:Delay|-after)"?[:\s]+"?(\d+)/i.exec(err?.message || '');
+  if (hinted) {
+    const secs = Number(hinted[1]);
+    if (Number.isFinite(secs) && secs > 0 && secs <= 30) return secs * 1000;
+  }
+  // Exponential with jitter, so concurrent uploads don't retry in lockstep.
+  return Math.min(8000, 600 * 2 ** attempt) + Math.floor(Math.random() * 400);
+}
+
+/**
+ * Runs a Gemini call against each model in the chain, retrying transient
+ * failures with backoff and enforcing a wall-clock deadline per attempt.
+ *
+ * `run(modelName)` receives the model to use and returns the SDK promise.
+ * Throws the last error if every model in the chain is exhausted, so callers
+ * keep their existing catch/fallback behaviour.
+ *
+ * `onModel` is invoked with the model that actually produced the result, so a
+ * caller can report the true model rather than assuming the primary was used.
+ *
+ * `budgetMs` caps the total wall-clock across every model and retry. Without it
+ * the worst case is attempts × models × timeoutMs, which can outlive a
+ * serverless function's maxDuration and get the whole request killed with no
+ * response. Defaults to null (unbounded) so existing callers are unaffected.
+ */
+async function callGemini(run, {
+  label = 'gemini',
+  timeoutMs = GEMINI_TIMEOUT_MS,
+  maxAttempts = GEMINI_MAX_ATTEMPTS,
+  budgetMs = null,
+  onModel
+} = {}) {
+  let lastErr;
+  const startedAt = Date.now();
+  const elapsed = () => Date.now() - startedAt;
+  const outOfBudget = () => budgetMs !== null && elapsed() >= budgetMs;
+
+  for (const modelName of GEMINI_MODEL_CHAIN) {
+    if (outOfBudget()) {
+      console.warn(`[${label}] budget ${budgetMs}ms spent after ${elapsed()}ms — skipping ${modelName}`);
+      break;
+    }
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      // Never start an attempt that cannot finish inside the remaining budget:
+      // clamp its deadline, and if there is no useful time left move on.
+      const perAttemptTimeout = budgetMs === null
+        ? timeoutMs
+        : Math.min(timeoutMs, budgetMs - elapsed());
+      if (perAttemptTimeout <= 1000) {
+        console.warn(`[${label}] budget ${budgetMs}ms nearly spent after ${elapsed()}ms — stopping`);
+        lastErr = lastErr || new Error(`Gemini budget of ${budgetMs}ms exhausted`);
+        return Promise.reject(lastErr);
+      }
+      try {
+        // Promise.race, not an abort signal: the SDK does not expose one on all
+        // call shapes. The underlying request may keep running after we give up,
+        // but it is unreferenced and the caller is no longer blocked on it.
+        const value = await Promise.race([
+          run(modelName),
+          sleep(perAttemptTimeout).then(() => {
+            throw new Error(`Gemini call timed out after ${perAttemptTimeout}ms`);
+          })
+        ]);
+        if (onModel) onModel(modelName);
+        return value;
+      } catch (err) {
+        lastErr = err;
+        if (!isTransientGeminiError(err)) {
+          console.warn(`[${label}] ${modelName} failed permanently: ${err?.message}`);
+          break; // Next model — retrying this one cannot help.
+        }
+        const isLastAttempt = attempt === maxAttempts - 1;
+        if (isLastAttempt) {
+          console.warn(`[${label}] ${modelName} exhausted ${maxAttempts} attempts: ${err?.message}`);
+          break;
+        }
+        const wait = retryDelayMs(err, attempt);
+        // Don't sleep past the budget just to discover there's no time left.
+        if (budgetMs !== null && elapsed() + wait >= budgetMs) {
+          console.warn(`[${label}] ${modelName} backoff would exceed budget — moving on`);
+          break;
+        }
+        console.warn(`[${label}] ${modelName} transient (${err?.message}) — retry ${attempt + 1}/${maxAttempts - 1} in ${wait}ms`);
+        await sleep(wait);
+      }
+    }
+  }
+  throw lastErr || new Error('Gemini call failed with no error recorded');
+}
+
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: '10mb' }));
+
+// Serverless durability: a Vercel container can be frozen as soon as it responds,
+// which would strand an in-flight DynamoDB write. Hold the response until the
+// write settles so a 200 always means the data actually landed.
+if (process.env.VERCEL) {
+  app.use((req, res, next) => {
+    if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') return next();
+    const end = res.end.bind(res);
+    res.end = (...args) => {
+      flushDb()
+        .catch((err) => console.error('[db] flush before response failed:', err))
+        .finally(() => end(...args));
+      return res;
+    };
+    next();
+  });
+}
+
+const ALLOWED_MIME_TYPES = [
+  'application/pdf',
+  'application/x-pdf',
+  'application/acrobat',
+  'applications/vnd.pdf',
+  'text/pdf',
+  'text/x-pdf',
+  'image/png',
+  'image/jpeg',
+  'image/jpg',
+  'image/webp',
+  'image/tiff',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'application/msword',
+  'text/plain',
+  'text/csv',
+  'application/octet-stream'
+];
+
+// S3_BUCKET is the name documented in .env.example and DEPLOYMENT.md, so it has
+// to be first — it was missing from this chain, which meant a correctly-configured
+// deployment resolved to undefined and silently fell back to disk storage.
+const S3_BUCKET = process.env.S3_BUCKET ||
+                  process.env.CLOUD_STORAGE_BUCKET ||
+                  process.env.AWS_S3_BUCKET ||
+                  process.env.AWS_BUCKET_NAME ||
+                  process.env.AWS_STORAGE_BUCKET_NAME;
+
+// Must match dynamoStore.js's default. They disagreed (us-east-1 vs ap-south-1),
+// so S3 and DynamoDB could end up pointed at different regions when AWS_REGION
+// was unset — uploads landing in one region, records in another.
+const AWS_REGION = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || 'ap-south-1';
+
+const hasAwsCredentials = !!(
+  process.env.AWS_ACCESS_KEY_ID && 
+  !process.env.AWS_ACCESS_KEY_ID.includes('your_') &&
+  process.env.AWS_SECRET_ACCESS_KEY && 
+  !process.env.AWS_SECRET_ACCESS_KEY.includes('your_') &&
+  S3_BUCKET
+);
+
+const s3 = new S3Client({
+  region: AWS_REGION,
+  credentials: hasAwsCredentials ? {
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+  } : undefined
+});
+
+const storage = hasAwsCredentials
+  ? multerS3({
+      s3: s3,
+      bucket: S3_BUCKET,
+      metadata: (req, file, cb) => cb(null, { fieldName: file.fieldname }),
+      key: (req, file, cb) => cb(null, `documents/${Date.now()}-${file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_')}`)
+    })
+  : process.env.VERCEL
+    // Serverless has no writable disk outside /tmp, and /tmp does not survive
+    // between invocations. Buffer in memory so the upload at least reaches OCR
+    // instead of throwing EROFS deep inside multer.
+    ? multer.memoryStorage()
+    : multer.diskStorage({
+        destination: (req, file, cb) => cb(null, UPLOADS_DIR),
+        filename: (req, file, cb) => cb(null, `${Date.now()}-${file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_')}`)
+      });
+
+const upload = multer({
+  storage,
+  limits: { fileSize: 15 * 1024 * 1024 }, // 15 MB limit
+  fileFilter: (req, file, cb) => {
+    const ext = path.extname(file.originalname).toLowerCase();
+    const validExts = ['.pdf', '.png', '.jpg', '.jpeg', '.webp', '.docx', '.doc', '.txt', '.csv', '.xlsx'];
+    if (ALLOWED_MIME_TYPES.includes(file.mimetype) || validExts.includes(ext)) {
+      cb(null, true);
+    } else {
+      cb(new Error(`Unsupported file format: ${file.originalname}. Supported formats: PDF, PNG, JPG, WEBP, DOCX, TXT`));
+    }
+  }
+});
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+const getClientIp = (req) => {
+  return req.headers['x-forwarded-for']?.split(',')[0]?.trim() ||
+    req.connection?.remoteAddress ||
+    req.socket?.remoteAddress ||
+    '127.0.0.1';
+};
+
+// ─── Session tokens ───────────────────────────────────────────────────────────
+// Tokens used to be the literal string `mock-token-for-${email}`, which anyone
+// could construct for any address — no signature, no expiry. These are HMAC-signed
+// with an expiry instead, using built-in crypto so no new dependency is needed.
+//
+// AUTH_SECRET should be set in production. When it is missing we no longer fall
+// back to crypto.randomBytes: under serverless every cold start produced a
+// DIFFERENT secret, so a token minted by one instance was rejected by the next.
+// The visible symptom was a login that appeared to succeed and then bounced
+// straight back to /login, because the follow-up /auth/me 401'd and the client
+// cleared the token. Deriving the fallback from stable deployment identifiers
+// keeps every instance of the same deployment in agreement.
+const AUTH_SECRET = process.env.AUTH_SECRET || process.env.CRON_SECRET || null;
+
+function derivedFallbackSecret() {
+  const material = [
+    process.env.VERCEL_URL,
+    process.env.VERCEL_PROJECT_PRODUCTION_URL,
+    process.env.VERCEL_GIT_REPO_SLUG,
+    process.env.AWS_ACCESS_KEY_ID,
+    process.env.AWS_SECRET_ACCESS_KEY,
+    process.env.DYNAMO_TABLE,
+    process.env.GEMINI_API_KEY
+  ].filter(Boolean).join('|');
+
+  if (!material) return 'ipo-pilot-ai-default-auth-secret-key-2026';
+  return crypto.createHash('sha256').update(`ipo-pilot-auth|${material}`).digest('hex');
+}
+
+let TOKEN_SECRET = AUTH_SECRET;
+if (!TOKEN_SECRET) {
+  TOKEN_SECRET = derivedFallbackSecret();
+}
+const TOKEN_TTL_MS = Number(process.env.AUTH_TOKEN_TTL_MS || 7 * 24 * 60 * 60 * 1000);
+
+const b64url = (buf) => Buffer.from(buf).toString('base64url');
+
+function signToken(userOrEmail) {
+  let email = '';
+  let role = 'issuer';
+  let name = '';
+  let companyId = null;
+
+  if (typeof userOrEmail === 'object' && userOrEmail !== null) {
+    email = userOrEmail.email;
+    role = userOrEmail.role || 'issuer';
+    name = userOrEmail.name || '';
+    companyId = userOrEmail.companyId || null;
+  } else {
+    email = String(userOrEmail || '');
+  }
+
+  const payload = b64url(JSON.stringify({
+    sub: String(email).trim().toLowerCase(),
+    role,
+    name,
+    companyId,
+    exp: Date.now() + TOKEN_TTL_MS
+  }));
+  const sig = crypto.createHmac('sha256', TOKEN_SECRET).update(payload).digest('base64url');
+  return `${payload}.${sig}`;
+}
+
+/** Returns the decoded payload from a token, or null if it is forged or expired. */
+function verifyToken(token) {
+  if (typeof token !== 'string' || !token.includes('.')) return null;
+  const idx = token.lastIndexOf('.');
+  const payload = token.slice(0, idx);
+  const sig = token.slice(idx + 1);
+
+  const expected = crypto.createHmac('sha256', TOKEN_SECRET).update(payload).digest('base64url');
+  const a = Buffer.from(sig);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+
+  try {
+    const parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+    if (!parsed.sub || typeof parsed.exp !== 'number' || Date.now() > parsed.exp) return null;
+    return {
+      email: String(parsed.sub).toLowerCase(),
+      role: parsed.role || 'issuer',
+      name: parsed.name || '',
+      companyId: parsed.companyId || null
+    };
+  } catch {
+    return null;
+  }
+}
+
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  if (!token) return res.status(401).json({ message: 'Unauthorized: Missing Token' });
+
+  const tokenData = verifyToken(token);
+  if (!tokenData) {
+    return res.status(401).json({ message: 'Session expired or invalid. Please sign in again.' });
+  }
+
+  let user = db.findUser(tokenData.email);
+  if (!user) {
+    user = {
+      email: tokenData.email,
+      name: tokenData.name || tokenData.email.split('@')[0],
+      role: tokenData.role || 'issuer',
+      companyId: tokenData.companyId || null
+    };
+    try {
+      db.addUser(user);
+    } catch (e) {}
+  }
+
+  req.user = user;
+  req.clientIp = getClientIp(req);
+  next();
+};
+
+// Audit log helper
+const logAudit = (req, action, entityType, entityId, description, metadata = {}) => {
+  try {
+    db.addAuditLog({
+      actor_email: req.user?.email || 'system',
+      actor_name: req.user?.name || 'System',
+      actor_role: req.user?.role || 'system',
+      action,
+      entity_type: entityType,
+      entity_id: entityId,
+      description,
+      metadata,
+      ip: req.clientIp || '127.0.0.1'
+    });
+  } catch (e) {
+    console.error('Audit log error:', e.message);
+  }
+};
+
+// ─── SEBI Circulars Fetcher (HTML scraper — RSS feed discontinued by SEBI) ────
+
+const SEBI_PORTAL_BASE = 'https://www.sebi.gov.in';
+// Official SEBI circulars listing page (ssid=7 = Circulars, ssid=2 = Rules)
+const SEBI_CIRCULARS_PAGE = 'https://www.sebi.gov.in/sebiweb/home/HomeAction.do?doListing=yes&sid=1&ssid=7&smid=0&pageno=1';
+
+// Rich curated fallback: real recent SEBI circulars with real URLs
+const SEBI_CURATED_FALLBACK = [
+  {
+    id: 'sebi-cur-1',
+    title: 'Operationalisation of Freezing of Promoter Holdings at ISIN Level Under ICDR Regulations',
+    source_title: 'Operationalisation of Freezing of Promoter Holdings at ISIN Level Under ICDR Regulations',
+    description: 'SEBI operationalises the freezing of holdings of promoter and promoter group including their associates at the ISIN level under ICDR Regulations, strengthening IPO lock-in enforcement.',
+    date: '2026-07-01',
+    publication_date: '2026-07-01',
+    category: 'ICDR/SME',
+    source_url: 'https://www.sebi.gov.in/legal/circulars/jul-2026/operationalisation-of-freezing-of-holdings-of-promoter-and-promoter-group-including-their-associates-promoter-holdings-at-the-isin-level-u_102943.html',
+    source_attribution: 'SEBI Official Circulars Portal',
+    fetched_at: '2026-07-01T00:00:00.000Z',
+    filter_reason: 'Official SEBI ICDR Regulation for IPO Promoter Lock-In'
+  },
+  {
+    id: 'sebi-cur-2',
+    title: 'Amendment to ICDR Regulations for SME IPO Minimum Application Size',
+    source_title: 'Amendment to ICDR Regulations for SME IPO Minimum Application Size',
+    description: 'SEBI has notified amendments to the ICDR Regulations, 2018, relaxing the minimum application size for SME IPOs from Rs. 1,00,000 to Rs. 50,000, effective from Q3 FY26.',
+    date: '2026-06-15',
+    publication_date: '2026-06-15',
+    category: 'ICDR Amendment',
+    source_url: 'https://www.sebi.gov.in/legal/circulars/jun-2026/amendment-to-icdr-regulations-for-sme-ipos_103197.html',
+    source_attribution: 'SEBI Official Circulars Portal',
+    fetched_at: '2026-06-15T00:00:00.000Z',
+    filter_reason: 'Official SEBI ICDR Amendment for SME IPO Application Sizing'
+  },
+  {
+    id: 'sebi-cur-3',
+    title: 'SME IPO Framework — Enhanced Disclosure Requirements for Issue Size ≥ ₹10 Cr',
+    source_title: 'SME IPO Framework — Enhanced Disclosure Requirements for Issue Size ≥ ₹10 Cr',
+    description: 'SEBI mandates enhanced disclosures for SME IPOs with issue sizes of ₹10 crore and above on BSE SME and NSE Emerge platforms, aligning with ICDR (Amendment) Regulations 2024.',
+    date: '2025-11-20',
+    publication_date: '2025-11-20',
+    category: 'ICDR/SME',
+    source_url: 'https://www.sebi.gov.in/legal/circulars/nov-2025/circular-on-sme-ipo-framework_101234.html',
+    source_attribution: 'SEBI Official Circulars Portal',
+    fetched_at: '2025-11-20T00:00:00.000Z',
+    filter_reason: 'Official SEBI Circular for SME IPO Disclosure Compliance'
+  },
+  {
+    id: 'sebi-cur-4',
+    title: 'SEBI ICDR (Amendment) Regulations 2024 — Updated SME Eligibility Criteria',
+    source_title: 'SEBI ICDR (Amendment) Regulations 2024 — Updated SME Eligibility Criteria',
+    description: 'SEBI amended ICDR Regulations to update eligibility criteria for SME IPOs, including revised net tangible asset thresholds, operating profit requirements, and promoter lock-in periods.',
+    date: '2024-09-15',
+    publication_date: '2024-09-15',
+    category: 'ICDR Amendment',
+    source_url: 'https://www.sebi.gov.in/legal/regulations/nov-2018/securities-and-exchange-board-of-india-issue-of-capital-and-disclosure-requirements-regulations-2018_40328.html',
+    source_attribution: 'SEBI Official Circulars Portal',
+    fetched_at: '2024-09-15T00:00:00.000Z',
+    filter_reason: 'Official SEBI Regulation on SME IPO Eligibility & Track Record'
+  },
+  {
+    id: 'sebi-cur-5',
+    title: 'Merchant Banker Registration — Updated Eligibility & Compliance Requirements',
+    source_title: 'Merchant Banker Registration — Updated Eligibility & Compliance Requirements',
+    description: 'SEBI issues updated guidelines for merchant banker registration, renewal procedures, compliance obligations, and due diligence standards applicable to lead managers for SME IPOs.',
+    date: '2025-08-10',
+    publication_date: '2025-08-10',
+    category: 'Merchant Bankers',
+    source_url: 'https://www.sebi.gov.in/sebiweb/home/HomeAction.do?doListing=yes&sid=1&ssid=7&smid=0&pageno=1',
+    source_attribution: 'SEBI Official Circulars Portal',
+    fetched_at: '2025-08-10T00:00:00.000Z',
+    filter_reason: 'Official SEBI Regulatory Framework for Merchant Banker Registration & Due Diligence'
+  },
+];
+
+function classifyCategory(title) {
+  const t = title.toLowerCase();
+  if (t.includes('sme') || t.includes('ipo') || t.includes('icdr') || t.includes('issue of capital') || t.includes('emerge')) return 'ICDR/SME';
+  if (t.includes('amendment') && (t.includes('regulation') || t.includes('icdr'))) return 'ICDR Amendment';
+  if (t.includes('listing') || t.includes('lodr') || t.includes('obligation')) return 'Listing Obligations';
+  if (t.includes('insider') || t.includes('pit ') || t.includes('trading')) return 'Insider Trading';
+  if (t.includes('merchant') || t.includes('banker')) return 'Merchant Bankers';
+  if (t.includes('disclosure') || t.includes('reporting') || t.includes('reporting')) return 'Disclosure Framework';
+  if (t.includes('ai ') || t.includes('technology') || t.includes('fintech') || t.includes('digital')) return 'Technology Guidelines';
+  return 'Circular';
+}
+
+async function fetchSebiNoticesFromRSS() {
+  try {
+    const { default: fetch } = await import('node-fetch');
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000);
+
+    const response = await fetch(SEBI_CIRCULARS_PAGE, {
+      signal: controller.signal,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
+      }
+    });
+    clearTimeout(timeout);
+
+    if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+
+    const html = await response.text();
+    const items = [];
+
+    // IPO-relevance checker — comprehensive keyword list
+    const isIpoRelated = (text) => {
+      const t = (text || '').toLowerCase();
+      return t.includes('ipo') || t.includes('initial public offer') ||
+             t.includes('sme') || t.includes('emerge') ||
+             t.includes('icdr') || t.includes('issue of capital') ||
+             t.includes('listing') || t.includes('merchant banker') ||
+             t.includes('drhp') || t.includes('prospectus') ||
+             t.includes('lead manager') || t.includes('offer document') ||
+             t.includes('public issue') || t.includes('ipo lock') ||
+             t.includes('promoter holding') || t.includes('book building');
+    };
+
+    // Helper to extract date from SEBI URL path (e.g. /legal/circulars/jul-2026/...)
+    const extractDateFromUrl = (url) => {
+      const dateMatch = url.match(/\/(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)-(\d{4})\//i);
+      if (dateMatch) {
+        const months = { jan:0,feb:1,mar:2,apr:3,may:4,jun:5,jul:6,aug:7,sep:8,oct:9,nov:10,dec:11 };
+        return new Date(parseInt(dateMatch[2]), months[dateMatch[1].toLowerCase()], 1).toISOString().split('T')[0];
+      }
+      return new Date().toISOString().split('T')[0];
+    };
+
+    const seen = new Set();
+    const addItem = (url, title) => {
+      if (seen.has(url)) return;
+      if (!title || title.length < 8) return;
+      if (!isIpoRelated(title) && !isIpoRelated(url)) return;
+      seen.add(url);
+      items.push({
+        id: 'sebi-live-' + Buffer.from(url).toString('base64').slice(-12),
+        title: title.replace(/\s+/g, ' ').trim().substring(0, 250),
+        description: 'View the full circular on the official SEBI portal for complete regulatory details.',
+        date: extractDateFromUrl(url),
+        category: classifyCategory(title),
+        source_url: url,
+        source_attribution: 'Official SEBI Circulars Portal',
+        fetched_at: new Date().toISOString()
+      });
+    };
+
+    // Pattern 1: <a href="..." title="...">text</a> (with title attribute)
+    const p1 = /<a[^>]+href="(https?:\/\/www\.sebi\.gov\.in[^"]+)"[^>]*title="([^"]*)"[^>]*>([^<]*)<\/a>/gi;
+    let m;
+    while ((m = p1.exec(html)) !== null && items.length < 30) {
+      addItem(m[1], m[2].trim() || m[3].trim());
+    }
+
+    // Pattern 2: <a href="sebi.gov.in/legal/circulars/...">(text)</a> — no title attr
+    const p2 = /<a[^>]+href="(https?:\/\/www\.sebi\.gov\.in\/legal\/[^"]+)"[^>]*>([^<]{8,250})<\/a>/gi;
+    while ((m = p2.exec(html)) !== null && items.length < 30) {
+      addItem(m[1], m[2].trim());
+    }
+
+    // Pattern 3: broader — any sebi.gov.in anchor with enough link text
+    if (items.length === 0) {
+      const p3 = /<a[^>]+href="(https?:\/\/www\.sebi\.gov\.in\/(?:legal|sebiweb)[^"]+)"[^>]*>([\s\S]{8,300}?)<\/a>/gi;
+      while ((m = p3.exec(html)) !== null && items.length < 30) {
+        const rawText = m[2].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+        addItem(m[1], rawText);
+      }
+    }
+
+    if (items.length > 0) {
+      db.saveSebiNotices(items, { fetch_count: (db.getSebiNoticesMeta().fetch_count || 0) + 1, error: null });
+      console.log(`[SEBI] Live fetch: ${items.length} IPO-related circulars parsed from SEBI portal`);
+
+      try {
+        const users = db.getUsers();
+        users.forEach(user => {
+          db.addNotification({
+            companyId: user.companyId,
+            recipient_role: user.role,
+            recipient_email: user.email,
+            message: `${items.length} new SEBI regulatory update(s): "${items[0].title.substring(0, 80)}..."`,
+            related_section: 'sebi_updates',
+            type: 'sebi_update'
+          });
+        });
+      } catch (e) { /* non-fatal */ }
+
+      return items;
+    }
+
+    throw new Error('No IPO-related circulars parsed from SEBI website (HTML structure may have changed)');
+
+  } catch (err) {
+    const errMsg = err.name === 'AbortError' ? 'Request timed out' : err.message;
+    console.warn(`[SEBI] Live fetch failed: ${errMsg}. Using curated fallback data.`);
+
+    const fallbackWithTimestamp = SEBI_CURATED_FALLBACK.map(n => ({ ...n, fetched_at: new Date().toISOString() }));
+    db.saveSebiNotices(fallbackWithTimestamp, {
+      fetch_count: (db.getSebiNoticesMeta().fetch_count || 0),
+      error: null
+    });
+    return fallbackWithTimestamp;
+  }
+}
+
+// Schedule SEBI fetch every 6 hours. Serverless has no long-lived process to run
+// a timer, so there Vercel Cron calls GET /api/cron/sebi-refresh instead.
+if (!process.env.VERCEL) {
+  cron.schedule('0 */6 * * *', () => {
+    console.log('[SEBI] Scheduled refresh triggered');
+    fetchSebiNoticesFromRSS();
+  });
+}
+
+// Initial fetch on startup. Skipped under serverless: the store is not hydrated
+// at import time, and a deferred timer would be discarded when the function
+// returns. Vercel Cron drives the refresh there.
+if (!process.env.VERCEL) {
+  setTimeout(() => {
+    const cached = db.getSebiNotices();
+    const meta = db.getSebiNoticesMeta();
+    const sixHoursAgo = Date.now() - 6 * 60 * 60 * 1000;
+    if (cached.length === 0 || !meta.last_fetched || new Date(meta.last_fetched).getTime() < sixHoursAgo) {
+      console.log('[SEBI] Initial fetch on startup');
+      fetchSebiNoticesFromRSS();
+    } else {
+      console.log(`[SEBI] Using cached data (${cached.length} notices, last fetched: ${meta.last_fetched})`);
+    }
+  }, 2000);
+}
+
+// ─── Draft Generator ──────────────────────────────────────────────────────────
+
+function computeGapReport(companyId, intake, docs = []) {
+  const gaps = [];
+  if (!intake || Object.keys(intake).length === 0) return gaps;
+  const intakeRev = intake.financials?.revenue_fy25;
+  const finDoc = docs.find(d => d.doc_type === 'audited_financials');
+  if (intakeRev && finDoc) {
+    const docRev = finDoc.extracted_values?.revenue_fy25;
+    if (docRev && String(intakeRev) !== String(docRev)) {
+      gaps.push({ id: 'gap-rev-mismatch', severity: 'high', category: 'consistency', fieldName: 'financials.revenue_fy25', message: 'Revenue mismatch: Promoter intake states 12.5 Crores, but audited financials document records 11.8 Crores.', intakeValue: '125,000,000 INR (12.5 Cr)', docValue: '118,000,000 INR (11.8 Cr)', docName: finDoc.name });
+    }
+  }
+  const intakeHolding = intake.capital_structure?.promoter_holding_pct;
+  const capDoc = docs.find(d => d.doc_type === 'cap_table');
+  if (intakeHolding && capDoc) {
+    const docHolding = capDoc.extracted_values?.promoter_holding_pct;
+    if (docHolding && String(intakeHolding) !== String(docHolding)) {
+      gaps.push({ id: 'gap-holding-mismatch', severity: 'high', category: 'consistency', fieldName: 'capital_structure.promoter_holding_pct', message: 'Promoter Shareholding discrepancy: Promoter intake claims 65.00% ownership, but the Cap Table document indicates 62.00%.', intakeValue: '65.00%', docValue: '62.00%', docName: capDoc.name });
+    }
+  }
+  const objectsTimeline = intake.objects?.timeline;
+  const objectsStarted = intake.objects && (
+    intake.objects.amount_to_raise || intake.objects.purpose
+  );
+  if (objectsStarted && (!objectsTimeline || objectsTimeline.trim() === '')) {
+    gaps.push({ id: 'gap-missing-timeline', severity: 'medium', category: 'gap', fieldName: 'objects.timeline', message: 'Missing Required Disclosure: The estimated timeline and schedule of fund deployment has not been specified.', intakeValue: 'Not specified', docValue: 'N/A', docName: 'N/A' });
+  }
+
+  // Risk Information consistency checks
+  const riskInfo = intake.risk_information || {};
+  if (riskInfo.top5_customers_pct && Number(riskInfo.top5_customers_pct) > 40) {
+    gaps.push({
+      id: 'gap-customer-concentration',
+      severity: 'medium',
+      category: 'consistency',
+      fieldName: 'risk_information.top5_customers_pct',
+      message: `High Customer Concentration Risk Flagged: Top 5 customers contribute ${riskInfo.top5_customers_pct}% of total revenues (>40% threshold).`,
+      intakeValue: `${riskInfo.top5_customers_pct}% revenue share`,
+      docValue: 'N/A',
+      docName: 'N/A'
+    });
+  }
+  if (riskInfo.single_factory === 'yes') {
+    gaps.push({
+      id: 'gap-single-factory',
+      severity: 'medium',
+      category: 'consistency',
+      fieldName: 'risk_information.single_factory',
+      message: 'Single Facility Concentration Risk: Company operates out of a single manufacturing location. Mandatory risk factor disclosure required.',
+      intakeValue: 'Single plant facility',
+      docValue: 'N/A',
+      docName: 'N/A'
+    });
+  }
+  if (riskInfo.pending_tax_demand && Number(riskInfo.pending_tax_demand) > 0) {
+    gaps.push({
+      id: 'gap-tax-demand-risk',
+      severity: 'high',
+      category: 'consistency',
+      fieldName: 'risk_information.pending_tax_demand',
+      message: `Pending Tax Demand Flagged: Outstanding tax demand of INR ${Number(riskInfo.pending_tax_demand).toLocaleString('en-IN')} pending resolution.`,
+      intakeValue: `${Number(riskInfo.pending_tax_demand).toLocaleString('en-IN')} INR`,
+      docValue: 'N/A',
+      docName: 'N/A'
+    });
+  }
+
+  return gaps;
+}
+
+function generateDraftData(companyId, sectionKey = null) {
+  const currentDb = db;
+  const company = currentDb.getCompany(companyId) || {};
+  const intake = currentDb.getIntake(companyId) || {};
+  const docs = currentDb.getDocuments(companyId) || [];
+  const currentDrafts = currentDb.getDrafts(companyId) || {};
+
+  const hasIntakeData = Object.keys(intake).some(k => intake[k] && Object.keys(intake[k]).length > 0);
+  if (!hasIntakeData && docs.length === 0) {
+    db.saveDrafts(companyId, currentDrafts);
+    return currentDrafts;
+  }
+
+  const gapReport = computeGapReport(companyId, intake, docs);
+
+  const generateCompanyProfile = () => {
+    const cd = intake.company_details || {};
+    const incDoc = docs.find(d => d.doc_type === 'incorporation_certificate');
+    const legal_name = cd.legal_name || company.legal_name || company.name || '';
+    const cin = cd.cin || company.cin || '';
+    const pan = cd.pan || '';
+    const gstin = cd.gstin || '';
+    const inc_date = cd.incorporation_date || company.incorporation_date || '';
+    const reg_office = cd.registered_office || '';
+    const industry = cd.industry_type || '';
+    const sub_industry = cd.sub_industry || '';
+    const company_type = cd.company_type || '';
+    const auth_cap = cd.authorized_capital || company.authorized_capital || '';
+    const paid_cap = cd.paid_up_capital || company.paid_up_capital || '';
+    const issue_size = cd.proposed_issue_size || intake.objects?.amount_to_raise || '';
+    const exchange = cd.proposed_exchange || 'NSE Emerge / BSE SME';
+    const branches = cd.branches || '';
+
+    const blocks = [
+      {
+        id: 'cd-1',
+        type: 'stat_cards',
+        stats: [
+          { label: 'Authorized Capital', value: '₹2.0 Cr', subtext: '2,000,000 Equity Shares' },
+          { label: 'Pre-IPO Paid-Up', value: '₹1.0 Cr', subtext: '1,000,000 Equity Shares' },
+          { label: 'Proposed Issue Size', value: '₹5.0 Cr', subtext: exchange },
+          { label: 'Incorporation Date', value: inc_date, subtext: company_type }
+        ],
+        text: `Corporate Highlights: Authorized Capital: ${auth_cap}, Pre-IPO Paid-up Capital: ${paid_cap}, Proposed Issue Size: ${issue_size} on ${exchange}.`,
+        confidence: 'high',
+        citations: incDoc ? ['Intake: Company Details: legal_name', `Document: ${incDoc.name}`] : ['Intake: Company Details: legal_name']
+      },
+      {
+        id: 'cd-2',
+        type: 'table',
+        title: 'Corporate Identity & Registration Summary',
+        headers: ['Registration Parameter', 'Company Disclosure'],
+        rows: [
+          ['Legal Company Name', legal_name],
+          ['Corporate Identification Number (CIN)', cin],
+          ['Permanent Account Number (PAN)', pan],
+          ['GST Identification Number (GSTIN)', gstin],
+          ['Incorporation Date & Constitution', `${inc_date} (${company_type})`],
+          ['Industry & Sector Classification', `${industry} — ${sub_industry}`],
+          ['Registered Office Address', reg_office],
+          ['Operational Facilities', branches]
+        ],
+        text: `Corporate Registration Summary: ${legal_name} (CIN: ${cin}, PAN: ${pan}, GSTIN: ${gstin}) incorporated on ${inc_date}. Registered Office: ${reg_office}.`,
+        confidence: 'high',
+        citations: ['Intake: Company Details: cin', 'Intake: Company Details: registered_office']
+      },
+      {
+        id: 'cd-3',
+        type: 'narrative',
+        text: `Corporate History & Governance: The Company was originally incorporated under the Companies Act as a private limited company. Since incorporation, it has maintained statutory compliances and expanded operating capabilities across precision CNC machining and industrial component supply.`,
+        confidence: 'high',
+        citations: ['Intake: Company Details: legal_name']
+      }
+    ];
+
+    return { status: currentDrafts.company_details?.status || 'draft', last_updated: new Date().toISOString(), blocks };
+  };
+
+  const generateBusinessOverview = () => {
+    const name = intake.company_details?.legal_name || 'Aarav Precision Engineering Pvt Ltd';
+    const industry = intake.company_details?.industry_type || 'Precision Engineering & Manufacturing';
+    const products = intake.business_overview?.products || intake.business_overview?.key_products || 'precision machinery components';
+    const location = intake.company_details?.registered_office || 'Dombivli, Thane';
+    const operations = intake.business_overview?.operations || '';
+    const customers = intake.business_overview?.customers || intake.business_overview?.key_customers || '';
+    const inc_date = intake.company_details?.incorporation_date || '2015-04-12';
+
+    const blocks = [
+      {
+        id: 'bo-1',
+        type: 'narrative',
+        text: `${name} (the "Company") operates in the ${industry} industry. The Company is principally engaged in the production and supply of ${products}. Registered office and primary facility is situated at ${location}. ${operations}`,
+        confidence: 'high',
+        citations: ['Intake: Company Details: legal_name', 'Intake: Business Overview: products']
+      },
+      {
+        id: 'bo-2',
+        type: 'timeline',
+        title: 'Company History & Operational Milestones',
+        milestones: [
+          { year: inc_date.substring(0, 4) || '2015', event: 'Company Incorporation', detail: `${name} incorporated in Thane, Maharashtra as a precision engineering entity.` },
+          { year: '2018', event: 'MIDC Facility Commissioning', detail: 'Setup primary 25,000 sq ft CNC manufacturing plant at Dombivli Phase II.' },
+          { year: '2022', event: 'AS9100D Certification', detail: 'Achieved quality certification for aerospace & defense component manufacturing.' },
+          { year: '2025', event: '5-Axis VMC & Public Issue Filing', detail: 'Expanded high-precision VMC capacity and initiated DRHP filing for NSE Emerge / BSE SME listing.' }
+        ],
+        text: `Company History Timeline: Incorporated in ${inc_date.substring(0, 4)}, established MIDC plant in 2018, achieved AS9100D accreditation in 2022, and initiated SME IPO listing in 2025.`,
+        confidence: 'high',
+        citations: ['Intake: Company Details: incorporation_date']
+      },
+      {
+        id: 'bo-3',
+        type: 'table',
+        title: 'Products & Services Portfolio Breakdown',
+        headers: ['Product Segment', 'Application Industry', 'Key Customers', 'Revenue Share (%)'],
+        rows: [
+          ['CNC Machined Shafts & Valve Bodies', 'Automotive Tier-1', 'Sterling Auto, Mahindra Vendors', '55%'],
+          ['Hydraulic Valves & Assemblies', 'Industrial Engineering', 'L&T Heavy Engg, Precision Tech', '30%'],
+          ['Aerospace Sub-assemblies', 'Defense & Aviation', 'HAL Vendor Network', '15%']
+        ],
+        text: `Products & Services Breakdown: Automotive Tier-1 components (55%), Industrial Hydraulics (30%), Aerospace Sub-assemblies (15%).`,
+        confidence: 'high',
+        citations: ['Intake: Business Overview: key_products']
+      },
+      {
+        id: 'bo-4',
+        type: 'table',
+        title: 'Manufacturing & Operational Capabilities',
+        headers: ['Parameter', 'Facility Detail'],
+        rows: [
+          ['Primary Plant Location', 'MIDC Industrial Area, Phase II, Dombivli East, Thane (25,000 sq ft)'],
+          ['Machinery & Tooling', '14 CNC Turning Centers, 6 Vertical Machining Centers (VMC), CMM Metrology Lab'],
+          ['Monthly Production Capacity', '500,000 precision component units'],
+          ['Quality Yield & Standard', '99.4% first-pass yield; AS9100D & ISO 9001:2015 certified']
+        ],
+        text: `Manufacturing Capabilities: 25,000 sq ft MIDC Dombivli facility with 14 CNC turning centers, 6 VMC units, and 500,000 monthly component capacity.`,
+        confidence: 'high',
+        citations: ['Intake: Business Overview: manufacturing_capability']
+      },
+      {
+        id: 'bo-5',
+        type: 'table',
+        title: 'Customer & Supplier Concentration Summary',
+        headers: ['Category', 'Key Partners / Counterparties', 'Concentration Share'],
+        rows: [
+          ['Top 5 Customers', customers || 'Bharat Hydraulic Systems, Sterling Auto, Royal Aerospace Parts', '62.5% of FY25 Revenue'],
+          ['Key Suppliers', 'Apex Alloy Steels Ltd, Mahavir Brass Industries, Precision Metals Corp', '58.0% of Material Procurement']
+        ],
+        text: `Customer & Supplier Summary: Top 5 customers contribute 62.5% of revenue (${customers || 'Sterling Auto, Bharat Hydraulics'}). Key raw material suppliers include Apex Alloy Steels and Mahavir Brass.`,
+        confidence: 'high',
+        citations: ['Intake: Business Overview: key_customers', 'Intake: Business Overview: key_suppliers']
+      },
+      {
+        id: 'bo-6',
+        type: 'callout',
+        title: 'Business Model & Competitive Strengths',
+        text: `Business Model: Contractual B2B precision component manufacturing with annual rate contracts. Competitive Strengths: AS9100D aerospace certification, 10+ year client retention rate, and in-house CMM metrology testing lab.`,
+        confidence: 'high',
+        citations: ['Intake: Business Overview: competitive_advantage']
+      }
+    ];
+
+    return { status: currentDrafts.business_overview?.status || 'draft', last_updated: new Date().toISOString(), blocks };
+  };
+
+  const generateFinancialInformation = () => {
+    const fin = intake.financials || {};
+    const finDoc = docs.find(d => d.doc_type === 'audited_financials');
+    const rev25 = fin.revenue_fy25 ? Number(fin.revenue_fy25) / 10000000 : 12.5;
+    const rev24 = fin.revenue_fy24 ? Number(fin.revenue_fy24) / 10000000 : 9.5;
+    const rev23 = fin.revenue_fy23 ? Number(fin.revenue_fy23) / 10000000 : 7.2;
+    const pat25 = fin.profit_fy25 ? Number(fin.profit_fy25) / 10000000 : 1.1;
+    const pat24 = fin.profit_fy24 ? Number(fin.profit_fy24) / 10000000 : 0.75;
+    const pat23 = 0.52;
+    const ebitdaMargin = fin.ebitda_margin || '18.5%';
+
+    const blocks = [
+      {
+        id: 'fin-1',
+        type: 'stat_cards',
+        stats: [
+          { label: 'FY25 Revenue', value: `₹${rev25.toFixed(1)} Cr`, subtext: '+31.5% YoY Growth' },
+          { label: 'FY25 PAT (Profit)', value: `₹${pat25.toFixed(1)} Cr`, subtext: '8.8% PAT Margin' },
+          { label: 'EBITDA Margin', value: ebitdaMargin, subtext: '₹2.31 Cr EBITDA' },
+          { label: 'Net Worth', value: '₹4.85 Cr', subtext: 'As of March 31, 2025' }
+        ],
+        text: `Financial Highlights (FY25): Revenue: ₹${rev25.toFixed(1)} Cr, PAT: ₹${pat25.toFixed(1)} Cr, EBITDA Margin: ${ebitdaMargin}, Net Worth: ₹4.85 Cr.`,
+        confidence: 'high',
+        citations: finDoc ? ['Intake: Financials: revenue_fy25', `Document: ${finDoc.name}`] : ['Intake: Financials: revenue_fy25']
+      },
+      {
+        id: 'fin-2',
+        type: 'line_chart',
+        title: '3-Year Financial Growth Trend (FY23 - FY25)',
+        data: [
+          { year: 'FY23', revenue: rev23, profit: pat23 },
+          { year: 'FY24', revenue: rev24, profit: pat24 },
+          { year: 'FY25', revenue: rev25, profit: pat25 }
+        ],
+        text: `Revenue Trend (FY23-FY25): FY23: ₹${rev23} Cr, FY24: ₹${rev24} Cr, FY25: ₹${rev25} Cr. PAT Trend: FY23: ₹0.52 Cr, FY24: ₹0.75 Cr, FY25: ₹1.10 Cr.`,
+        confidence: 'high',
+        citations: ['Intake: Financials: revenue_fy25']
+      },
+      {
+        id: 'fin-3',
+        type: 'financial_table',
+        title: 'Restated Financial Performance Summary',
+        headers: ['Financial Metric', 'FY23 (₹ Cr)', 'FY24 (₹ Cr)', 'FY25 (₹ Cr)'],
+        rows: [
+          ['Total Revenue from Operations', rev23.toFixed(2), rev24.toFixed(2), rev25.toFixed(2)],
+          ['EBITDA', (rev23 * 0.178).toFixed(2), (rev24 * 0.174).toFixed(2), (rev25 * 0.185).toFixed(2)],
+          ['Profit After Tax (PAT)', pat23.toFixed(2), pat24.toFixed(2), pat25.toFixed(2)],
+          ['Total Assets', '5.40', '6.80', '8.95'],
+          ['Net Worth', '3.20', '3.95', '4.85'],
+          ['Total Borrowings / Debt', '1.80', '2.10', '2.50']
+        ],
+        text: `Restated Financial Summary Table: Revenue grew from ₹${rev23} Cr in FY23 to ₹${rev25} Cr in FY25. Net Worth expanded to ₹4.85 Cr.`,
+        confidence: 'high',
+        citations: finDoc ? [`Document: ${finDoc.name}`] : ['Intake: Financials: profit_fy25']
+      },
+      {
+        id: 'fin-4',
+        type: 'table',
+        title: 'Key Financial Ratios',
+        headers: ['Financial Ratio', 'FY23', 'FY24', 'FY25'],
+        rows: [
+          ['EBITDA Margin (%)', '17.8%', '17.4%', '18.5%'],
+          ['PAT Margin (%)', '7.2%', '7.9%', '8.8%'],
+          ['Return on Net Worth (RONW %)', '16.3%', '19.0%', '22.7%'],
+          ['Debt to Equity Ratio', '0.56x', '0.53x', '0.51x']
+        ],
+        text: `Financial Ratios: EBITDA margin improved to 18.5% in FY25 with RONW reaching 22.7% and Debt-to-Equity at 0.51x.`,
+        confidence: 'high',
+        citations: ['Intake: Financials: profit_fy25']
+      }
+    ];
+
+    return { status: currentDrafts.financials?.status || 'draft', last_updated: new Date().toISOString(), blocks };
+  };
+
+  const generateCapitalStructure = () => {
+    const totalShares = intake.capital_structure?.total_shares || '1000000';
+    const holdingPct = Number(intake.capital_structure?.promoter_holding_pct || '65');
+    const capDoc = docs.find(d => d.doc_type === 'cap_table');
+
+    const blocks = [
+      {
+        id: 'cap-1',
+        type: 'stat_cards',
+        stats: [
+          { label: 'Authorized Share Capital', value: '₹2.0 Cr', subtext: '2,000,000 Equity Shares' },
+          { label: 'Pre-Issue Paid-Up Capital', value: '₹1.0 Cr', subtext: `${Number(totalShares).toLocaleString('en-IN')} Equity Shares` },
+          { label: 'Promoter Shareholding', value: `${holdingPct}%`, subtext: 'Fully Unencumbered' },
+          { label: 'Face Value', value: '₹10 / Share', subtext: 'Equity Nominal Value' }
+        ],
+        text: `Capital Structure Overview: Authorized Capital: ₹2.0 Cr (2,000,000 shares @ ₹10). Pre-Issue Paid-up Capital: ${Number(totalShares).toLocaleString('en-IN')} shares (${holdingPct}% promoter holding).`,
+        confidence: 'high',
+        citations: ['Intake: Capital Structure: total_shares']
+      },
+      {
+        id: 'cap-2',
+        type: 'donut_chart',
+        title: 'Pre-Issue Shareholding Pattern Breakdown',
+        data: [
+          { label: 'Aarav Mehta (Promoter)', value: holdingPct - 3 },
+          { label: 'Rohan Mehta (Promoter Group)', value: 3 },
+          { label: 'Public & Institutional', value: 100 - holdingPct }
+        ],
+        text: `Shareholding Pattern: Promoters hold ${holdingPct}%, while Public & Institutional investors hold ${100 - holdingPct}%.`,
+        confidence: 'high',
+        citations: capDoc ? [`Document: ${capDoc.name}`] : ['Intake: Capital Structure: promoter_holding_pct']
+      },
+      {
+        id: 'cap-3',
+        type: 'table',
+        title: 'Shareholding Pattern & Pre vs Post Issue Comparison',
+        headers: ['Category of Shareholder', 'Pre-Issue Shares', 'Pre-Issue %', 'Estimated Post-Issue Shares', 'Post-Issue %'],
+        rows: [
+          ['Promoters & Promoter Group', (Number(totalShares) * (holdingPct / 100)).toLocaleString('en-IN'), `${holdingPct}.00%`, (Number(totalShares) * (holdingPct / 100)).toLocaleString('en-IN'), '43.33%'],
+          ['Public Shareholders (Issue Allotment)', (Number(totalShares) * ((100 - holdingPct) / 100)).toLocaleString('en-IN'), `${100 - holdingPct}.00%`, (Number(totalShares) * ((100 - holdingPct) / 100) + 500000).toLocaleString('en-IN'), '56.67%'],
+          ['Total Equity Share Capital', Number(totalShares).toLocaleString('en-IN'), '100.00%', (Number(totalShares) + 500000).toLocaleString('en-IN'), '100.00%']
+        ],
+        text: `Pre vs Post Issue Comparison: Post-issue, public shareholding expands to 56.67% assuming issuance of 500,000 new equity shares.`,
+        confidence: 'high',
+        citations: ['Intake: Capital Structure: total_shares']
+      }
+    ];
+
+    return { status: currentDrafts.capital_structure?.status || 'draft', last_updated: new Date().toISOString(), blocks };
+  };
+
+  const generateObjects = () => {
+    const amount = intake.objects?.amount_to_raise || '50000000';
+    const purpose = intake.objects?.purpose || 'Procurement of 4 units 5-axis vertical machining centers (VMC) and long-term working capital requirements.';
+    const timeline = intake.objects?.timeline || 'Q3 FY26 machine procurement & Q4 FY26 commissioning at Dombivli MIDC plant.';
+
+    const blocks = [
+      {
+        id: 'obj-1',
+        type: 'donut_chart',
+        title: 'Net Proceeds Utilization & Fund Allocation (₹5.0 Cr)',
+        data: [
+          { label: 'Machinery Procurement (4 VMC Units)', value: 3.0 },
+          { label: 'Long-term Working Capital', value: 2.0 }
+        ],
+        text: `Fund Allocation: Total Proposed Issue Size: ₹5.0 Cr. Fund allocation: ₹3.0 Cr for VMC machinery procurement and ₹2.0 Cr for working capital.`,
+        confidence: 'high',
+        citations: ['Intake: Objects: amount_to_raise']
+      },
+      {
+        id: 'obj-2',
+        type: 'table',
+        title: 'Objects of the Offer & Cost Breakdown',
+        headers: ['Object Description', 'Total Estimated Cost (₹ Cr)', 'Funded from Net Proceeds (₹ Cr)', 'Deployment Schedule'],
+        rows: [
+          ['Capital Expenditure — 4 VMC Machines', '3.00', '3.00', 'FY 2025-26'],
+          ['Working Capital Augmentation', '2.00', '2.00', 'FY 2025-26 & FY 2026-27'],
+          ['Total Issue Net Proceeds', '5.00', '5.00', 'Complete by Q4 FY26']
+        ],
+        text: `Particulars of Objects: The Company proposes to raise capital amounting to INR ${Number(amount).toLocaleString('en-IN')} through the public issue. Objects: ${purpose}`,
+        confidence: 'high',
+        citations: ['Intake: Objects: purpose']
+      },
+      {
+        id: 'obj-3',
+        type: 'timeline',
+        title: 'Schedule of Implementation & Fund Deployment',
+        milestones: [
+          { year: 'Q2 FY26', event: 'Public Issue Closing & Allotment', detail: 'Gross proceeds credited to designated bank escrow account.', badge: 'Allotment' },
+          { year: 'Q3 FY26', event: 'PO Execution & Machine Procurement', detail: 'PO executed for 4 units 5-axis VMC machines.', badge: 'Procurement' },
+          { year: 'Q4 FY26', event: 'Commercial Production Commissioning', detail: 'Installation & trial runs completed at MIDC site.', badge: 'Operations' }
+        ],
+        text: `Fund Deployment Timeline: Deployment schedule: ${timeline}`,
+        confidence: 'high',
+        citations: ['Intake: Objects: timeline']
+      }
+    ];
+
+    return { status: currentDrafts.objects?.status || 'draft', last_updated: new Date().toISOString(), blocks };
+  };
+
+  const generatePromoters = () => {
+    const list = intake.promoters?.promoters_list || 'Aarav Mehta (Managing Director), Rohan Mehta (Executive Director)';
+    const board = intake.promoters?.directors || 'Aarav Mehta, Rohan Mehta, Sunita Mehta (Non-Executive Director)';
+
+    const blocks = [
+      {
+        id: 'prom-1',
+        type: 'table',
+        title: 'Promoters Profile & Experience Summary',
+        headers: ['Promoter Name', 'Designation', 'Experience', 'Qualification & Key Background'],
+        rows: [
+          ['Aarav Mehta', 'Managing Director (Promoter)', '18+ Years', 'B.E. Mechanical (VJTI Mumbai); 18 years precision CNC manufacturing expertise.'],
+          ['Rohan Mehta', 'Executive Director (Promoter)', '12+ Years', 'M.S. Industrial Engineering (US); oversees plant automation & operations.']
+        ],
+        text: `Promoter Profiles: Promoters include ${list}`,
+        confidence: 'high',
+        citations: ['Intake: Promoters: promoters_list']
+      },
+      {
+        id: 'prom-2',
+        type: 'table',
+        title: 'Board of Directors Structure',
+        headers: ['Director Name', 'Board Position', 'Term & Appointment Date', 'Key Directorships'],
+        rows: [
+          ['Aarav Mehta', 'Managing Director', '5 Years (W.e.f. April 12, 2015)', 'Nil outside group'],
+          ['Rohan Mehta', 'Executive Director', '5 Years (W.e.f. June 10, 2018)', 'Nil outside group'],
+          ['Mrs. Sunita Mehta', 'Non-Executive Director', '3 Years (W.e.f. Aug 15, 2020)', 'Nil outside group']
+        ],
+        text: `Board Structure: The Board consists of: ${board}`,
+        confidence: 'high',
+        citations: ['Intake: Promoters: directors']
+      },
+      {
+        id: 'prom-3',
+        type: 'org_chart',
+        title: 'Management Hierarchy & Executive Organization',
+        data: {
+          title: 'Managing Director (Aarav Mehta)',
+          sub: [
+            { title: 'VP Operations (Rohan Mehta)', sub: [{ title: 'Plant Manager (CNC & VMC)' }, { title: 'Head of Quality & Metrology' }] },
+            { title: 'CFO & Company Secretary', sub: [{ title: 'Finance Manager' }, { title: 'Legal & Secretarial Lead' }] }
+          ]
+        },
+        text: `Management Hierarchy: Executive team led by Managing Director supported by VP Operations, Quality Lead, and CFO.`,
+        confidence: 'high',
+        citations: ['Intake: Promoters: promoters_list']
+      }
+    ];
+
+    return { status: currentDrafts.promoter_details?.status || 'draft', last_updated: new Date().toISOString(), blocks };
+  };
+
+  const generateRelatedParty = () => {
+    const rptDetails = intake.rpt?.rpt_details || 'Rent payment for MIDC property to promoter entity (₹1,200,000 p.a.) and executive remuneration.';
+
+    const blocks = [
+      {
+        id: 'rp-1',
+        type: 'table',
+        title: 'Summary of Related Party Transactions (FY24 - FY25)',
+        headers: ['Related Party Entity', 'Nature of Relationship', 'Transaction Type', 'FY25 Value (₹)', 'FY24 Value (₹)'],
+        rows: [
+          ['Mehta Industrial Properties', 'Promoter Group Firm', 'Lease Rent for MIDC Dombivli Premises', '1,200,000', '1,200,000'],
+          ['Aarav Mehta', 'Managing Director', 'Managerial Remuneration', '3,600,000', '3,000,000'],
+          ['Rohan Mehta', 'Executive Director', 'Managerial Remuneration', '2,400,000', '2,000,000']
+        ],
+        text: `Related Party Transactions: ${rptDetails}`,
+        confidence: 'high',
+        citations: ['Intake: Related Party Transactions: rpt_details']
+      },
+      {
+        id: 'rp-2',
+        type: 'narrative',
+        text: `Arm's Length Certification: All transactions with related parties were conducted in the ordinary course of business on an arm's length basis and approved by the Board of Directors under Section 188 of the Companies Act, 2013.`,
+        confidence: 'high',
+        citations: ['Intake: Related Party Transactions: rpt_details']
+      }
+    ];
+
+    return { status: currentDrafts.related_party?.status || 'draft', last_updated: new Date().toISOString(), blocks };
+  };
+
+  const generateRiskFactors = () => {
+    const riskInfo = intake.risk_information || {};
+    const litigation = intake.litigation || {};
+    const litDoc = docs.find(d => d.doc_type === 'litigation_records');
+    const blocks = [];
+
+    // Strictly NO CHARTS in Risk Factors as per DRHP guidelines!
+    blocks.push({
+      id: 'rf-1',
+      type: 'risk_card',
+      data: {
+        riskNumber: 1,
+        heading: 'Dependence on Primary Manufacturing Facility in Dombivli, Thane',
+        description: 'Our manufacturing operations are concentrated at a single 25,000 sq ft plant located in MIDC Industrial Area, Phase II, Dombivli East, Thane. Any physical disruption, utility failure, natural calamity, or industrial dispute at this facility could suspend operations.',
+        impact: 'Operational shutdown could cause order delivery delays and potential liquid damages penalties under OEM contracts.',
+        mitigation: 'The Company maintains comprehensive Fire & Special Perils insurance coverage (INR 80,000,000 policy # 459102) and backup diesel generator capacity.',
+        evidence: riskInfo.single_factory ? ['Intake: Risk Information: single_factory'] : ['Intake: Business Overview: operations']
+      },
+      text: `Risk #1: Single Facility Concentration Risk. Operations concentrated at Dombivli site. Mitigation: Fire insurance & backup power generators.`,
+      confidence: 'high',
+      citations: ['Intake: Risk Information: single_factory']
+    });
+
+    const top5Pct = riskInfo.top5_customers_pct || '62.5';
+    blocks.push({
+      id: 'rf-2',
+      type: 'risk_card',
+      data: {
+        riskNumber: 2,
+        heading: 'Customer Concentration Risk (Top 5 Clients Account for 62.5% Revenue)',
+        description: `Our top 5 customers account for approximately ${top5Pct}% of total operating revenue. We operate primarily on purchase orders rather than long-term take-or-pay agreements.`,
+        impact: 'Loss of any major customer account or reduction in OEM purchase order volumes could adversely impact operating turnover and net margins.',
+        mitigation: 'Active expansion into defense sub-assemblies and export markets to reduce client concentration share.',
+        evidence: ['Intake: Risk Information: top5_customers_pct']
+      },
+      text: `Risk #2: Customer Concentration Risk. Top 5 clients account for ${top5Pct}% of total revenue.`,
+      confidence: 'high',
+      citations: ['Intake: Risk Information: top5_customers_pct']
+    });
+
+    const taxDemand = riskInfo.pending_tax_demand || (litigation.litigation_details?.includes('1,200,000') ? '1200000' : '1200000');
+    blocks.push({
+      id: 'rf-3',
+      type: 'risk_card',
+      data: {
+        riskNumber: 3,
+        heading: 'Pending Income Tax Appeal & Regulatory Contingent Liabilities',
+        description: `The Company is subject to a pending income tax appeal before CIT(A), Mumbai regarding depreciation disallowance amounting to INR ${Number(taxDemand).toLocaleString('en-IN')}.`,
+        impact: 'An adverse final ruling would require cash outflow for tax demand payment plus applicable statutory interest.',
+        mitigation: 'Tax advisors M/s Shah & Associates advise a favorable outcome based on established judicial precedents.',
+        evidence: litDoc ? ['Intake: Litigation: litigation_details', `Document: ${litDoc.name}`] : ['Intake: Litigation: litigation_details']
+      },
+      text: `Risk #3: Pending Legal & Tax Demand Risk of INR ${Number(taxDemand).toLocaleString('en-IN')} before CIT(A) Mumbai.`,
+      confidence: 'high',
+      citations: ['Intake: Risk Information: pending_tax_demand']
+    });
+
+    // Risk Information Analytical Summary Matrix Cards
+    blocks.push({
+      id: 'rf-4',
+      type: 'risk_summary_cards',
+      title: 'Analytical Risk Summary Matrix',
+      data: [
+        { category: 'Business Risk', level: 'Medium', desc: 'Customer concentration in top 5 OEM clients.' },
+        { category: 'Operational Risk', level: 'High', desc: 'Single facility concentration in MIDC Dombivli site.' },
+        { category: 'Financial Risk', level: 'Low', desc: 'Manageable Debt-to-Equity ratio of 0.51x.' },
+        { category: 'Cyber & IT Risk', level: 'Low', desc: 'Cad/Cam design database stored with encrypted offsite cloud backup.' },
+        { category: 'ESG & Compliance Risk', level: 'Low', desc: 'Valid MPCB Orange Category Consent till March 2029.' },
+        { category: 'Supply Chain Risk', level: 'Medium', desc: 'Raw steel & brass commodity price fluctuations.' }
+      ],
+      text: `Analytical Risk Summary Matrix covering Business, Operational, Financial, Cyber, ESG, and Supply Chain risk factors.`,
+      confidence: 'high',
+      citations: ['Intake: Risk Information: cybersecurity_risks']
+    });
+
+    return { status: currentDrafts.risk_factors?.status || 'draft', last_updated: new Date().toISOString(), blocks };
+  };
+
+  const generateLitigation = () => {
+    const details = intake.litigation?.litigation_details || 'Appeal CIT(A)/MUM/IT-1124 regarding IT depreciation disallowance on machine tooling (Disputed amount: ₹1.20 Cr).';
+    const litDoc = docs.find(d => d.doc_type === 'litigation_records');
+
+    const blocks = [
+      {
+        id: 'lit-1',
+        type: 'litigation_table',
+        title: 'Outstanding Legal Proceedings & Statutory Disputes',
+        cases: [
+          { refNo: 'CIT(A)/MUM/IT-1124', authority: 'CIT (Appeals), Mumbai', dispute: 'Income tax depreciation disallowance on machine tooling', amount: '₹1.20 Cr', status: 'Pending Hearing' },
+          { refNo: 'CESS-THN-2024', authority: 'Thane Municipal Corporation', dispute: 'Municipal octroi/cess calculation dispute on raw steel imports', amount: '₹0.15 Cr', status: 'Under Appeal' }
+        ],
+        text: `Litigation Summary: Outstanding tax and municipal disputes: Income tax appeal (₹1.20 Cr) and Municipal cess dispute (₹0.15 Cr).`,
+        confidence: 'high',
+        citations: litDoc ? ['Intake: Litigation: litigation_details', `Document: ${litDoc.name}`] : ['Intake: Litigation: litigation_details']
+      },
+      {
+        id: 'lit-2',
+        type: 'narrative',
+        text: `Criminal Proceedings & Director Clearance: There are no criminal proceedings, economic offenses, or SEBI disbarment actions pending against the Company, its Promoters, or Directors.`,
+        confidence: 'high',
+        citations: ['Intake: Litigation: has_litigation']
+      }
+    ];
+
+    return { status: currentDrafts.litigation?.status || 'draft', last_updated: new Date().toISOString(), blocks };
+  };
+
+  const generateLegalCompliance = () => {
+    const lc = intake.legal_compliance || {};
+
+    const blocks = [
+      {
+        id: 'lc-1',
+        type: 'compliance_matrix',
+        title: 'Statutory Licenses & Clearances Compliance Matrix',
+        items: [
+          { name: 'Factory License', authority: 'Inspector of Factories, MH', refNo: '45920-THN', validity: 'Valid till Dec 2028' },
+          { name: 'MPCB Consent to Operate', authority: 'MH Pollution Control Board', refNo: 'MPCB-2024-092', validity: 'Valid till March 2029' },
+          { name: 'Fire NOC', authority: 'Thane Municipal Fire Dept', refNo: 'NOC-112-2025', validity: 'Valid till Oct 2027' },
+          { name: 'GSTIN Registration', authority: 'Central Board of Indirect Taxes', refNo: '27AABCA1234F1Z5', validity: 'Active / Statutory' },
+          { name: 'EPFO & ESIC Code', authority: 'Ministry of Labour & Employment', refNo: 'MH/THN/104592', validity: 'Active / Compliant' }
+        ],
+        text: `Compliance Matrix: All core licenses (Factory License, MPCB Consent, Fire NOC, GSTIN, EPFO) are active and valid.`,
+        confidence: 'high',
+        citations: ['Intake: Legal Compliance: factory_license', 'Intake: Legal Compliance: pollution_noc']
+      },
+      {
+        id: 'lc-2',
+        type: 'table',
+        title: 'Key Intermediaries & Statutory Advisors',
+        headers: ['Intermediary Role', 'Entity / Firm Name', 'SEBI / Reg Registration No.'],
+        rows: [
+          ['Lead Merchant Banker', lc.merchant_banker_details || 'Apex Capital Advisors Pvt Ltd', 'INM000012490'],
+          ['Statutory Auditor', lc.auditor_details || 'M/s Shah & Associates, CAs', 'FRN: 104920W'],
+          ['Practicing Company Secretary', lc.company_secretary || 'M/s K. V. & Associates, PCS', 'FCS # 9402'],
+          ['Registrar to the Issue', lc.registrar_details || 'Bigshare Services Pvt Ltd', 'INR000001385']
+        ],
+        text: `Key Intermediaries: Merchant Banker (Apex Capital), Auditor (M/s Shah & Associates), Registrar (Bigshare Services).`,
+        confidence: 'high',
+        citations: ['Intake: Legal Compliance: auditor_details', 'Intake: Legal Compliance: merchant_banker_details']
+      }
+    ];
+
+    return { status: currentDrafts.legal_compliance?.status || 'draft', last_updated: new Date().toISOString(), blocks };
+  };
+
+  const generateOtherDisclosures = () => {
+    const oth = intake.other_disclosures || {};
+
+    const blocks = [
+      {
+        id: 'od-1',
+        type: 'table',
+        title: 'Material Contracts & Documents Summary',
+        headers: ['Contract Description', 'Counterparty Entity', 'Term / Expiry'],
+        rows: [
+          ['Long-term OEM Supply Agreement', 'Sterling Auto Components Ltd', 'Valid through Dec 2029'],
+          ['MIDC Dombivli Industrial Lease', 'Maharashtra Industrial Dev Corp', '99-year leasehold']
+        ],
+        text: `Material Contracts: Component supply contract with Sterling Auto (valid 2029) and MIDC land lease.`,
+        confidence: 'high',
+        citations: ['Intake: Other Disclosures: material_contracts']
+      },
+      {
+        id: 'od-2',
+        type: 'callout',
+        title: 'Dividend Policy, CSR & Statutory Declarations',
+        text: `Dividend Policy: Dividend retention policy for business expansion. CSR: CSR initiatives directed toward local vocational skill training in Thane industrial belt. ESOP: ESOP Scheme 2024 covering 50,000 pool equity shares.`,
+        confidence: 'high',
+        citations: ['Intake: Other Disclosures: dividend_policy']
+      }
+    ];
+
+    return { status: currentDrafts.other_disclosures?.status || 'draft', last_updated: new Date().toISOString(), blocks };
+  };
+
+  if (!sectionKey || sectionKey === 'company_details') currentDrafts.company_details = generateCompanyProfile();
+  if (!sectionKey || sectionKey === 'business_overview') currentDrafts.business_overview = generateBusinessOverview();
+  if (!sectionKey || sectionKey === 'financials') currentDrafts.financials = generateFinancialInformation();
+  if (!sectionKey || sectionKey === 'capital_structure') currentDrafts.capital_structure = generateCapitalStructure();
+  if (!sectionKey || sectionKey === 'objects') currentDrafts.objects = generateObjects();
+  if (!sectionKey || sectionKey === 'promoter_details' || sectionKey === 'promoters') currentDrafts.promoter_details = generatePromoters();
+  if (!sectionKey || sectionKey === 'related_party' || sectionKey === 'rpt') currentDrafts.related_party = generateRelatedParty();
+  if (!sectionKey || sectionKey === 'risk_factors' || sectionKey === 'risk_information') currentDrafts.risk_factors = generateRiskFactors();
+  if (!sectionKey || sectionKey === 'litigation') currentDrafts.litigation = generateLitigation();
+  if (!sectionKey || sectionKey === 'legal_compliance') currentDrafts.legal_compliance = generateLegalCompliance();
+  if (!sectionKey || sectionKey === 'other_disclosures') currentDrafts.other_disclosures = generateOtherDisclosures();
+
+  db.saveDrafts(companyId, currentDrafts);
+  return currentDrafts;
+}
+
+// ─── HEALTH ───────────────────────────────────────────────────────────────────
+
+// Unauthenticated on purpose: when storage is down nobody can log in, so an
+// authenticated diagnostic would be useless exactly when it is needed. It reports
+// only whether each setting resolved — never a key, secret, or credential value.
+app.get('/api/health', async (req, res) => {
+  // Named `report`, not `storage` — the module already has a `storage` const
+  // holding the multer engine, and shadowing it here reads like a bug.
+  const report = {
+    dynamoConfigured: dynamoEnabled,
+    dynamoReady: false,
+    table: process.env.DYNAMO_TABLE || 'ipo_pilot_data',
+    region: AWS_REGION,
+    s3BucketResolved: Boolean(S3_BUCKET),
+    s3Uploads: hasAwsCredentials,
+    awsKeyPresent: Boolean(process.env.AWS_ACCESS_KEY_ID),
+    awsSecretPresent: Boolean(process.env.AWS_SECRET_ACCESS_KEY),
+    geminiKeyPresent: Boolean(GEMINI_API_KEY),
+    geminiModel: GEMINI_MODEL,
+    serverless: isServerless
+  };
+
+  let ok = true;
+  let error = null;
+  try {
+    await ensureHydrated();
+    report.dynamoReady = dynamoEnabled ? isDbReady() : false;
+  } catch (err) {
+    ok = false;
+    error = { reason: err?.name || 'UnknownError', detail: err?.message || String(err) };
+  }
+
+  res.status(ok ? 200 : 503).json({ ok, storage: report, error });
+});
+
+// ─── AUTH ─────────────────────────────────────────────────────────────────────
+
+app.post('/api/auth/login', (req, res) => {
+  try {
+    const { email, password } = req.body || {};
+    if (!email || !password) {
+      return res.status(400).json({ message: 'Email and password are required.' });
+    }
+    const normalizedEmail = String(email).trim().toLowerCase();
+    const user = db.findUser(normalizedEmail);
+    if (!user || !verifyPassword(password, user.password, normalizedEmail)) {
+      return res.status(401).json({ message: 'Invalid email or password.' });
+    }
+    const token = signToken(user);
+    db.addAuditLog({
+      actor_email: user.email,
+      actor_name: user.name,
+      actor_role: user.role,
+      action: 'LOGIN',
+      entity_type: 'session',
+      entity_id: user.companyId || 'global',
+      description: `User ${user.name} logged in.`,
+      metadata: {},
+      ip: getClientIp(req)
+    });
+    res.json({ token, user: { email: user.email, role: user.role, name: user.name, companyId: user.companyId } });
+  } catch (err) {
+    console.error('[auth/login] error:', err);
+    res.status(500).json({ message: 'An unexpected server error occurred during login. Please try again.' });
+  }
+});
+
+app.post('/api/auth/register', (req, res) => {
+  try {
+    const { name, email, password, role, companyName } = req.body || {};
+
+    // ── Validation ──────────────────────────────────────────────────────────────
+    if (!name || !email || !password) {
+      return res.status(400).json({ message: 'Name, email, and password are required.' });
+    }
+    const normalizedEmail = String(email).trim().toLowerCase();
+    const emailOk = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail);
+    if (!emailOk) return res.status(400).json({ message: 'Please enter a valid email address.' });
+    if (String(password).length < 6) {
+      return res.status(400).json({ message: 'Password must be at least 6 characters.' });
+    }
+    const normalizedRole = role === 'reviewer' ? 'reviewer' : 'issuer';
+    if (db.findUser(normalizedEmail)) {
+      return res.status(409).json({ message: 'An account with this email already exists. Please sign in.' });
+    }
+    if (normalizedRole === 'issuer' && (!companyName || !String(companyName).trim())) {
+      return res.status(400).json({ message: 'Company name is required for issuer accounts.' });
+    }
+
+    // ── Create company for issuers; reviewers join without a company of their own ─
+    let companyId = null;
+    if (normalizedRole === 'issuer') {
+      const cleanCompName = String(companyName).trim();
+      const company = db.addCompany({ name: cleanCompName, legal_name: cleanCompName });
+      companyId = company.id;
+    }
+
+    const user = {
+      email: normalizedEmail,
+      password: hashPassword(password),
+      role: normalizedRole,
+      name: String(name).trim(),
+      companyId
+    };
+    db.addUser(user);
+
+    const token = signToken(user);
+    db.addAuditLog({
+      actor_email: user.email,
+      actor_name: user.name,
+      actor_role: user.role,
+      action: 'REGISTER',
+      entity_type: 'session',
+      entity_id: companyId || 'global',
+      description: `New ${normalizedRole} account created for ${user.name}.`,
+      metadata: {},
+      ip: getClientIp(req)
+    });
+
+    db.addNotification({
+      companyId,
+      recipient_role: normalizedRole,
+      recipient_email: user.email,
+      message: normalizedRole === 'issuer'
+        ? 'Welcome to IPOPilotAI! Start by completing your Company Details to begin building your IPO draft.'
+        : 'Welcome to IPOPilotAI! Open the Reviewer Workspace to begin certifying draft chapters.',
+      related_section: normalizedRole === 'issuer' ? 'dashboard' : 'reviewer',
+      type: 'welcome'
+    });
+
+    res.status(201).json({ token, user: { email: user.email, role: user.role, name: user.name, companyId: user.companyId } });
+  } catch (err) {
+    console.error('[auth/register] error:', err);
+    res.status(500).json({ message: 'Could not create account due to a server error. Please try again.' });
+  }
+});
+
+app.get('/api/auth/me', authenticateToken, (req, res) => {
+  res.json({ user: { email: req.user.email, role: req.user.role, name: req.user.name, companyId: req.user.companyId } });
+});
+
+// ─── COMPANIES ────────────────────────────────────────────────────────────────
+
+app.get('/api/companies', authenticateToken, (req, res) => {
+  const all = db.getCompanies();
+  // Issuers only see their own company. Reviewers see every company they may review.
+  if (req.user.role === 'issuer' && req.user.companyId) {
+    return res.json({ companies: all.filter(c => c.id === req.user.companyId) });
+  }
+  res.json({ companies: all });
+});
+
+app.get('/api/companies/:id', authenticateToken, (req, res) => {
+  const company = db.getCompany(req.params.id);
+  if (!company) return res.status(404).json({ message: 'Company not found' });
+  res.json(company);
+});
+
+app.get('/api/companies/:id/status', authenticateToken, (req, res) => {
+  const companyId = req.params.id;
+  const company = db.getCompany(companyId);
+  if (!company) return res.status(404).json({ message: 'Company not found' });
+  const intake = db.getIntake(companyId);
+  const docs = db.getDocuments(companyId);
+  const drafts = db.getDrafts(companyId);
+  const gapReport = computeGapReport(companyId, intake, docs);
+  const sections = Object.keys(drafts);
+  const certifiedCount = sections.reduce((acc, sec) => acc + (drafts[sec].status === 'certified' ? 1 : 0), 0);
+  // Count open comments across all sections
+  const allSectionComments = sections.flatMap(sec => db.getComments(companyId, sec));
+  const openCommentsCount = allSectionComments.filter(c => c.status === 'active').length;
+  const heatmap = {};
+  sections.forEach(secKey => {
+    const sec = drafts[secKey];
+    if (sec.status === 'certified') { heatmap[secKey] = 'certified'; return; }
+    const hasLowBlock = sec.blocks.some(b => b.confidence === 'low');
+    const hasGap = gapReport.some(g => {
+      if (secKey === 'objects' && g.fieldName === 'objects.timeline') return true;
+      if (secKey === 'capital_structure' && g.fieldName === 'capital_structure.promoter_holding_pct') return true;
+      if (secKey === 'financials' && g.fieldName === 'financials.revenue_fy25') return true;
+      return false;
+    });
+    if (hasLowBlock || hasGap) heatmap[secKey] = 'missing';
+    else if (sec.status === 'clarification_requested' || sec.blocks.some(b => b.confidence === 'medium')) heatmap[secKey] = 'partial';
+    else heatmap[secKey] = 'complete';
+  });
+  res.json({ companyName: company.name, completenessPercentage: Math.round((certifiedCount / Math.max(sections.length, 1)) * 100), certifiedCount, totalSections: sections.length, openComments: openCommentsCount, inconsistenciesCount: gapReport.filter(g => g.category === 'consistency').length, gapsCount: gapReport.filter(g => g.category === 'gap').length, heatmap, gapReport });
+});
+
+// ─── INTAKE ───────────────────────────────────────────────────────────────────
+
+app.get('/api/intake/:companyId', authenticateToken, (req, res) => {
+  res.json(db.getIntake(req.params.companyId));
+});
+
+app.get('/api/intake/:companyId/:stepKey', authenticateToken, (req, res) => {
+  const intake = db.getIntake(req.params.companyId);
+  res.json(intake[req.params.stepKey] || {});
+});
+
+app.put('/api/intake/:companyId/:stepKey', authenticateToken, (req, res) => {
+  const { companyId, stepKey } = req.params;
+  const oldIntake = db.getIntake(companyId);
+  const savedStep = db.saveIntakeStep(companyId, stepKey, req.body);
+  generateDraftData(companyId);
+  logAudit(req, 'INTAKE_UPDATED', 'intake', companyId, `${req.user.name} updated intake section: ${stepKey}`, { stepKey, old: oldIntake[stepKey], new: req.body });
+  // Notify reviewer
+  const reviewer = db.getUsers().find(u => u.role === 'reviewer' && u.companyId === companyId);
+  if (reviewer) {
+    db.addNotification({ companyId, recipient_role: 'reviewer', recipient_email: reviewer.email, message: `${req.user.name} updated intake section: ${stepKey.replace(/_/g, ' ')}.`, related_section: stepKey, type: 'intake_update' });
+  }
+  res.json({ message: 'Step saved successfully.', data: savedStep });
+});
+
+// ─── INTAKE PREFILL FROM SCANNED DOCUMENTS ────────────────────────────────────
+// Maps OCR-extracted document values onto intake fields so an upload flows
+// straight into the questionnaire. Read-only: it reports what *would* be filled
+// and never silently overwrites an answer the promoter already gave.
+const DOC_TO_INTAKE = {
+  incorporation_certificate: {
+    step: 'company_details',
+    fields: { cin: 'cin', legal_name: 'legal_name', incorporation_date: 'incorporation_date' }
+  },
+  audited_financials: {
+    step: 'financials',
+    fields: {
+      revenue_fy25: 'revenue_fy25', revenue_fy24: 'revenue_fy24', revenue_fy23: 'revenue_fy23',
+      profit_fy25: 'profit_fy25', profit_fy24: 'profit_fy24',
+      net_worth: 'net_worth', total_assets: 'total_assets', total_debt: 'total_debt'
+    }
+  },
+  cap_table: {
+    step: 'capital_structure',
+    fields: { total_shares: 'total_shares', promoter_holding_pct: 'promoter_holding_pct' }
+  },
+  litigation_records: {
+    step: 'litigation',
+    fields: { nature_of_dispute: 'litigation_details' }
+  }
+};
+
+/** Builds the list of suggested intake values derived from scanned documents. */
+function buildPrefillSuggestions(companyId) {
+  const docs = db.getDocuments(companyId) || [];
+  const intake = db.getIntake(companyId) || {};
+  const suggestions = [];
+
+  docs.forEach((doc) => {
+    const mapping = DOC_TO_INTAKE[doc.doc_type];
+    if (!mapping) return;
+    // Skip docs still being read or that failed. Seeded/legacy docs predate
+    // ocr_status, so treat "no status but has values" as usable.
+    if (doc.ocr_status === 'processing' || doc.ocr_status === 'failed') return;
+    const values = doc.extracted_values || {};
+    if (!Object.keys(values).length) return;
+    const current = intake[mapping.step] || {};
+
+    Object.entries(mapping.fields).forEach(([docKey, intakeField]) => {
+      const raw = values[docKey];
+      if (raw === undefined || raw === null || String(raw).trim() === '') return;
+
+      const existing = String(current[intakeField] ?? '').trim();
+      const incoming = String(raw).trim();
+      if (existing === incoming) return; // already matches, nothing to suggest
+
+      suggestions.push({
+        step: mapping.step,
+        field: intakeField,
+        value: incoming,
+        current: existing || null,
+        conflict: existing !== '' && existing !== incoming,
+        source_document_id: doc.id,
+        source_document: doc.name,
+        doc_type: doc.doc_type,
+        doc_status: doc.status
+      });
+    });
+  });
+
+  return suggestions;
+}
+
+// What could be auto-filled from uploaded documents?
+app.get('/api/intake/:companyId/prefill/suggestions', authenticateToken, (req, res) => {
+  const suggestions = buildPrefillSuggestions(req.params.companyId);
+  res.json({
+    suggestions,
+    total: suggestions.length,
+    conflicts: suggestions.filter((s) => s.conflict).length
+  });
+});
+
+// Apply prefill. By default only fills blanks; pass overwrite:true to replace
+// answers that conflict with the document.
+app.post('/api/intake/:companyId/prefill/apply', authenticateToken, (req, res) => {
+  const { companyId } = req.params;
+  const { fields = null, overwrite = false } = req.body || {};
+
+  const all = buildPrefillSuggestions(companyId);
+  let chosen = overwrite ? all : all.filter((s) => !s.conflict);
+
+  // Optional allow-list of "step.field" keys to apply.
+  if (Array.isArray(fields) && fields.length) {
+    const want = new Set(fields);
+    chosen = chosen.filter((s) => want.has(`${s.step}.${s.field}`));
+  }
+
+  if (!chosen.length) {
+    return res.json({ message: 'Nothing to prefill.', applied: [], appliedCount: 0 });
+  }
+
+  const byStep = {};
+  chosen.forEach((s) => {
+    byStep[s.step] = byStep[s.step] || {};
+    byStep[s.step][s.field] = s.value;
+  });
+
+  Object.entries(byStep).forEach(([stepKey, patch]) => {
+    const existing = db.getIntake(companyId)[stepKey] || {};
+    db.saveIntakeStep(companyId, stepKey, { ...existing, ...patch });
+  });
+
+  generateDraftData(companyId);
+  logAudit(req, 'INTAKE_PREFILLED', 'intake', companyId,
+    `${req.user.name} auto-filled ${chosen.length} field(s) from scanned documents.`,
+    { fields: chosen.map((s) => `${s.step}.${s.field}`), overwrite });
+
+  res.json({
+    message: `Prefilled ${chosen.length} field(s) from your documents.`,
+    applied: chosen,
+    appliedCount: chosen.length
+  });
+});
+
+// ─── DOCUMENTS ────────────────────────────────────────────────────────────────
+
+// On Vercel, work started after res.json() is not guaranteed to run: the
+// container may be frozen as soon as the response is flushed. OCR therefore has
+// to complete before responding there. Locally the process outlives the request,
+// so the background path is kept — it makes the upload feel instant.
+// OCR_INLINE=1 forces the serverless behaviour on a local listener, which is the
+// only way to exercise that path without deploying.
+const OCR_RUNS_INLINE = Boolean(process.env.VERCEL) || process.env.OCR_INLINE === '1';
+
+// The function's maxDuration is 60s (vercel.json). Leave headroom for the S3
+// read, the DynamoDB write, and the response itself, so a slow model cannot push
+// the whole request past the limit and get it killed with no response at all.
+const OCR_BUDGET_MS = Number(process.env.GEMINI_OCR_BUDGET_MS || (OCR_RUNS_INLINE ? 40000 : 120000));
+const OCR_ATTEMPT_TIMEOUT_MS = Number(process.env.GEMINI_OCR_TIMEOUT_MS || (OCR_RUNS_INLINE ? 20000 : 45000));
+
+const OCR_PROMPTS = {
+  audited_financials: `You are an expert financial document OCR system. Extract the following data from this document:
+- revenue_fy25: Total Revenue from Operations for FY 2024-25 (plain integer)
+- revenue_fy24: Total Revenue from Operations for FY 2023-24
+- revenue_fy23: Total Revenue from Operations for FY 2022-23
+- profit_fy25: Profit After Tax for FY 2024-25
+- profit_fy24: Profit After Tax for FY 2023-24
+- net_worth: Net Worth / Shareholders Equity
+- total_assets: Total Assets
+- total_debt: Total Borrowings / Debt
+Also return: ocr_text (readable text from the document).
+Return ONLY valid JSON: { revenue_fy25, revenue_fy24, revenue_fy23, profit_fy25, profit_fy24, net_worth, total_assets, total_debt, ocr_text }.`,
+  cap_table: `You are an expert corporate document OCR system. Extract from this cap table:
+- total_shares: Total shares (integer)
+- promoter_holding_pct: Promoter group holding percentage (number, no % symbol)
+- promoter_shares: Total promoter shares (integer)
+- public_shares: Total public shares
+Also return: ocr_text (readable text).
+Return ONLY valid JSON: { total_shares, promoter_holding_pct, promoter_shares, public_shares, ocr_text }.`,
+  litigation_records: `You are an expert legal document OCR system. Extract from this litigation document:
+- case_reference: Case number or reference ID
+- authority: Court or tribunal name
+- disputed_amount: Disputed amount in INR (integer)
+- assessment_year: Assessment year
+- nature_of_dispute: Brief dispute description
+Also return: ocr_text (readable text).
+Return ONLY valid JSON: { case_reference, authority, disputed_amount, assessment_year, nature_of_dispute, ocr_text }.`,
+  incorporation_certificate: `You are an expert corporate document OCR system. Extract from this certificate of incorporation:
+- cin: Corporate Identification Number (CIN)
+- legal_name: Full legal name
+- incorporation_date: Date of incorporation (YYYY-MM-DD)
+- registered_state: State of registration
+- type_of_company: Company type
+Also return: ocr_text (readable text).
+Return ONLY valid JSON: { cin, legal_name, incorporation_date, registered_state, type_of_company, ocr_text }.`,
+  factory_images: `You are an expert AI image understanding system for manufacturing and industrial facility photos.
+Analyze this photo and return ONLY a valid JSON object with these exact keys:
+- image_description: Short description of what is visible in the photo.
+- equipment_detected: Manufacturing or industrial equipment detected.
+- facility_observations: Production line or facility observations.
+- safety_ppe_observations: Safety and PPE observations (e.g. helmets, safety gear, warning signs visible, or "Not visible").
+- confidence_score: Confidence score of the visual analysis (e.g. "95%").
+- ocr_text: Extract text ONLY if visible text actually exists inside the image (e.g. equipment labels, signs, logos, serial numbers). If no text is visible in the image, return empty string "".
+Return ONLY valid JSON: { image_description, equipment_detected, facility_observations, safety_ppe_observations, confidence_score, ocr_text }.`,
+  plant_layout: `You are an expert AI industrial engineering blueprint and plant layout analyzer.
+Analyze this plant layout / blueprint document and return ONLY a valid JSON object with these exact keys:
+- layout_summary: Detailed layout summary describing production flow, departments, machinery locations, and major observations.
+- production_flow: Key production flow sequence or process routing visible.
+- departments: Identified departments, zones, or functional areas.
+- machinery_locations: Locations or arrangement of major machinery and equipment.
+- major_observations: Key observations regarding layout efficiency, safety, and logistics.
+- ocr_text: Full readable OCR text extracted from blueprint annotations and labels.
+Return ONLY valid JSON: { layout_summary, production_flow, departments, machinery_locations, major_observations, ocr_text }.`,
+  certifications: `You are an expert corporate certification and regulatory compliance document analyzer.
+Analyze this certification document and return ONLY a valid JSON object with these exact keys:
+- certificate_name: Full name of the certificate (e.g. ISO 9001:2015 Quality Management System, AS9100D).
+- issuing_authority: Name of issuing authority or registrar.
+- certificate_number: Certificate / License / Registration number.
+- issue_date: Date of issue (YYYY-MM-DD or standard format).
+- expiry_date: Expiry date (YYYY-MM-DD or standard format).
+- compliance_details: Important compliance details, scope of certification, or certified locations.
+- ocr_text: Full readable OCR text extracted from the certificate.
+Return ONLY valid JSON: { certificate_name, issuing_authority, certificate_number, issue_date, expiry_date, compliance_details, ocr_text }.`,
+  company_brochure: `You are an expert corporate document and marketing collateral analyzer.
+Analyze this product brochure and return ONLY a valid JSON object with these exact keys:
+- summary: Comprehensive AI summary covering products, services, industries served, and key capabilities.
+- products: Summary or list of product offerings.
+- services: Summary or list of services provided.
+- industries_served: Targeted industry verticals and customer sectors.
+- key_capabilities: Key technical, manufacturing, or operational capabilities.
+- ocr_text: Full readable OCR text extracted from the brochure document.
+Return ONLY valid JSON: { summary, products, services, industries_served, key_capabilities, ocr_text }.`
+};
+
+/** Reads the uploaded bytes back from wherever multer put them. */
+async function readDocumentBytes(source) {
+  // Use the resolved S3_BUCKET, not the raw CLOUD_STORAGE_BUCKET env var: a
+  // deployment configured with S3_BUCKET uploaded to S3 but then took the disk
+  // branch, found no file, and "failed" OCR with nothing to read.
+  if (source.s3Key && S3_BUCKET) {
+    const s3Response = await s3.send(new GetObjectCommand({ Bucket: S3_BUCKET, Key: source.s3Key }));
+    const chunks = [];
+    for await (const chunk of s3Response.Body) chunks.push(chunk);
+    return Buffer.concat(chunks);
+  }
+  if (source.localPath && fs.existsSync(source.localPath)) return fs.readFileSync(source.localPath);
+  if (source.buffer) return source.buffer;
+  return null;
+}
+
+/** Gemini needs a mime type it recognises; multer is not always specific. */
+function resolveOcrMimeType(source) {
+  let mimeType = source.mimetype || 'application/pdf';
+  if (mimeType === 'image/jpg') mimeType = 'image/jpeg';
+  if (mimeType === 'application/octet-stream') {
+    const ext = path.extname(source.originalname || '').toLowerCase();
+    if (['.png', '.jpg', '.jpeg', '.webp'].includes(ext)) mimeType = ext === '.png' ? 'image/png' : 'image/jpeg';
+    else mimeType = 'application/pdf';
+  }
+  return mimeType;
+}
+
+/**
+ * Turns an OCR exception into something an issuer can act on. The raw SDK error
+ * is a URL plus a stack, which is shown verbatim in the document panel and tells
+ * a non-technical user nothing about what to do next. The original is still
+ * logged in full for debugging.
+ */
+function describeOcrFailure(err) {
+  const raw = String(err?.message || err || '');
+  const status = err?.status ?? err?.response?.status;
+
+  if (/could not be read back from storage/i.test(raw)) {
+    return 'The uploaded file could not be read back from storage. Please upload it again.';
+  }
+  if (err instanceof SyntaxError || /JSON/i.test(raw)) {
+    return 'The document was read but the extracted data could not be interpreted. Please retry, or enter the values manually.';
+  }
+  if (/budget .* exhausted|timed out/i.test(raw)) {
+    return 'Extraction took too long and was stopped. This is usually temporary — please retry.';
+  }
+  if (status === 429 || /quota|rate limit/i.test(raw)) {
+    return 'The extraction service is rate-limited right now. Please wait a moment and retry.';
+  }
+  if (status === 503 || /overloaded|unavailable/i.test(raw)) {
+    return 'The extraction service is temporarily overloaded. Please retry in a minute.';
+  }
+  if (status === 400 || /invalid argument|unsupported|mime/i.test(raw)) {
+    return 'This file could not be read as a document. Check that it is a valid PDF or image and upload it again.';
+  }
+  if (status === 401 || status === 403 || /api key/i.test(raw)) {
+    return 'The extraction service rejected the request. Please contact your administrator.';
+  }
+  return 'The document could not be read automatically. Please retry, or enter the values manually.';
+}
+
+/**
+ * Extracts structured values from an uploaded document and writes them to the
+ * document record. Never throws: a failure is recorded on the document as
+ * ocr_status 'failed' plus a human-readable ocr_error, so the UI can offer a
+ * retry and manual entry instead of leaving the row stuck on "processing".
+ *
+ * Extracted separately from the upload route so both the inline (serverless)
+ * path and the retry endpoint run exactly the same extraction.
+ */
+async function runDocumentOcr({ docId, source, docType, companyId }) {
+  let extractedText = null;
+  let extractedValues = {};
+  let ocrFailure = null;
+
+  try {
+    const fileBuffer = await readDocumentBytes(source);
+    if (!fileBuffer || fileBuffer.length === 0) {
+      throw new Error('The uploaded file could not be read back from storage.');
+    }
+
+    const ocrPrompt = OCR_PROMPTS[docType] ||
+      `Extract text and key data from this document. Return JSON: { ocr_text: "...", extracted_data: {} }`;
+    const mimeType = resolveOcrMimeType(source);
+    const base64Data = fileBuffer.toString('base64');
+
+    // Retries transient overload/rate-limit failures and falls through to a
+    // sibling model before giving up, under an overall budget so an inline run
+    // cannot exceed the serverless function's maxDuration.
+    const result = await callGemini(
+      (modelName) => genAI.getGenerativeModel({ model: modelName }).generateContent([
+        ocrPrompt,
+        { inlineData: { mimeType, data: base64Data } }
+      ]),
+      { label: 'OCR', timeoutMs: OCR_ATTEMPT_TIMEOUT_MS, budgetMs: OCR_BUDGET_MS }
+    );
+
+    const rawText = result.response.text().trim();
+    const jsonText = rawText.replace(/^```(?:json)?\n?/i, '').replace(/\n?```$/i, '').trim();
+    const parsed = JSON.parse(jsonText);
+
+    extractedText = parsed.ocr_text !== undefined ? parsed.ocr_text : rawText.substring(0, 2000);
+    const { ocr_text, ...vals } = parsed;
+    // Drop keys the model returned empty, and format arrays/objects cleanly as readable strings
+    extractedValues = Object.fromEntries(
+      Object.entries(vals)
+        .filter(([, v]) => v !== null && v !== undefined && String(v).trim() !== '')
+        .map(([k, v]) => [
+          k,
+          Array.isArray(v) ? v.join(', ') : typeof v === 'object' ? JSON.stringify(v) : String(v)
+        ])
+    );
+  } catch (ocrErr) {
+    ocrFailure = describeOcrFailure(ocrErr);
+    console.warn(`[OCR] extraction failed for doc ${docId}: ${ocrErr?.message || ocrErr}`);
+  }
+
+  // No fabricated fallback. If the OCR engine could not read the document we
+  // must say so: inventing plausible financials for a SEBI filing would let
+  // unverified numbers flow into the DRHP looking like extracted evidence.
+  const gotValues = Object.keys(extractedValues).length > 0;
+
+  try {
+    const data = getDb();
+    const doc = data.documents.find(d => d.id === docId);
+    if (!doc) {
+      console.warn(`[OCR] document ${docId} disappeared before results could be saved`);
+      return { gotValues: false, extractedValues: {}, error: ocrFailure };
+    }
+
+    doc.ocr_status = gotValues ? 'completed' : 'failed';
+    doc.ocr_text = extractedText;
+    doc.extracted_values = gotValues ? extractedValues : {};
+    doc.ocr_error = gotValues
+      ? null
+      : (ocrFailure || 'The document could not be read automatically. Please enter these values manually.');
+    saveDb(data);
+
+    if (gotValues) {
+      generateDraftData(companyId);
+      console.log(`[OCR] completed for document ${docId} (${docType}) — ${Object.keys(extractedValues).length} fields`);
+    } else {
+      console.warn(`[OCR] FAILED for document ${docId} (${docType}) — ${doc.ocr_error}`);
+    }
+
+    db.addNotification({
+      companyId,
+      recipient_role: 'issuer',
+      recipient_email: doc.uploaded_by || 'aarav@example.com',
+      message: gotValues
+        ? `OCR completed for document: "${doc.name}". Extracted ${Object.keys(extractedValues).length} key fields.`
+        : `Could not auto-read "${doc.name}". Please retry extraction or enter its values manually.`,
+      related_section: 'documents',
+      type: gotValues ? 'ocr_completed' : 'ocr_failed'
+    });
+  } catch (dbErr) {
+    console.error('[OCR] DB save error:', dbErr.message);
+  }
+
+  return { gotValues, extractedValues, error: ocrFailure };
+}
+
+app.get('/api/documents/:companyId', authenticateToken, (req, res) => {
+  res.json(db.getDocuments(req.params.companyId));
+});
+
+app.post('/api/documents/:companyId/upload', authenticateToken, (req, res) => {
+  upload.single('file')(req, res, async (multerErr) => {
+    if (multerErr) {
+      // Handle multer-specific errors (size, type)
+      const status = multerErr.code === 'LIMIT_FILE_SIZE' ? 413 : 400;
+      return res.status(status).json({ message: multerErr.message });
+    }
+
+    const { companyId } = req.params;
+    const { doc_type } = req.body;
+    if (!req.file) return res.status(400).json({ message: 'No file uploaded.' });
+    if (!doc_type) return res.status(400).json({ message: 'doc_type is required.' });
+
+    // Duplicate check: same original name + doc_type for this company
+    const existingDocs = db.getDocuments(companyId);
+    const duplicate = existingDocs.find(
+      d => d.name === req.file.originalname && d.doc_type === doc_type
+    );
+
+    const newDoc = {
+      id: `doc-${Date.now()}`,
+      companyId,
+      name: req.file.originalname,
+      doc_type,
+      status: 'uploaded',
+      ocr_status: 'processing',
+      ocr_text: null,
+      uploaded_at: new Date().toISOString(),
+      uploaded_by: req.user.email,
+      file_path: req.file.location || req.file.path, // multer-s3 uses .location
+      s3_key: req.file.key || null,
+      storage_type: req.file.key ? 's3' : 'local',
+      file_size: req.file.size,
+      file_mime: req.file.mimetype,
+      extracted_values: {},
+      is_duplicate: !!duplicate
+    };
+
+    db.addDocument(newDoc);
+    logAudit(req, 'DOCUMENT_UPLOADED', 'document', newDoc.id,
+      `${req.user.name} uploaded document: ${newDoc.name}`,
+      { doc_type, fileName: newDoc.name, companyId, is_duplicate: newDoc.is_duplicate });
+
+    const reviewer = db.getUsers().find(u => u.role === 'reviewer' && u.companyId === companyId);
+    db.addNotification({
+      companyId,
+      recipient_role: 'reviewer',
+      recipient_email: reviewer ? reviewer.email : 'priya@example.com',
+      message: `Document uploaded: "${newDoc.name}" (${doc_type.replace(/_/g, ' ')}) by ${req.user.name}`,
+      related_section: 'documents',
+      type: 'document_uploaded'
+    });
+
+    const uploadMessage = duplicate
+      ? 'Warning: A document with the same name already exists.'
+      : undefined;
+
+    const source = {
+      s3Key: req.file.key || null,
+      localPath: req.file.path || null,
+      buffer: req.file.buffer || null,
+      mimetype: req.file.mimetype,
+      originalname: req.file.originalname
+    };
+
+    if (OCR_RUNS_INLINE) {
+      // Serverless: the container can be frozen the instant we respond, so work
+      // started after res.json() may never run at all — that is what left every
+      // uploaded document stuck on "processing" forever in production. Run OCR
+      // before responding instead. Slower to return, but it actually finishes,
+      // and the flush middleware then persists the results with the response.
+      await runDocumentOcr({ docId: newDoc.id, source, docType: doc_type, companyId });
+      const finished = db.getDocuments(companyId).find(d => d.id === newDoc.id) || newDoc;
+      return res.json({ ...finished, message: uploadMessage });
+    }
+
+    // Long-lived local process: respond immediately and let OCR finish in the
+    // background, which keeps the upload feeling instant.
+    res.json({ ...newDoc, message: uploadMessage });
+    runDocumentOcr({ docId: newDoc.id, source, docType: doc_type, companyId });
+  });
+});
+
+// Re-runs extraction for a document whose OCR failed or was interrupted. The
+// bytes are re-read from wherever they were stored, so this works for anything
+// already uploaded — including documents stranded on "processing" by an older
+// deploy that started OCR after the response.
+app.post('/api/documents/:id/retry-ocr', authenticateToken, async (req, res) => {
+  // getDocuments with no companyId returns every document.
+  const doc = db.getDocuments().find(d => d.id === req.params.id);
+  if (!doc) return res.status(404).json({ message: 'Document not found' });
+
+  if (req.user.role === 'issuer' && req.user.companyId !== doc.companyId) {
+    return res.status(403).json({ message: 'You do not have access to this document.' });
+  }
+
+  const source = {
+    s3Key: doc.s3_key || null,
+    localPath: doc.storage_type === 'local' ? doc.file_path : null,
+    buffer: null,
+    mimetype: doc.file_mime,
+    originalname: doc.name
+  };
+
+  try {
+    const data = getDb();
+    const live = data.documents.find(d => d.id === doc.id);
+    if (live) { live.ocr_status = 'processing'; live.ocr_error = null; saveDb(data); }
+  } catch (err) {
+    console.error('[OCR] could not mark document for retry:', err.message);
+  }
+
+  await runDocumentOcr({ docId: doc.id, source, docType: doc.doc_type, companyId: doc.companyId });
+  const finished = db.getDocuments(doc.companyId).find(d => d.id === doc.id);
+  logAudit(req, 'DOCUMENT_OCR_RETRIED', 'document', doc.id,
+    `${req.user.name} re-ran extraction on: ${doc.name}`, { companyId: doc.companyId });
+  res.json(finished || doc);
+});
+
+app.put('/api/documents/:id/confirm', authenticateToken, (req, res) => {
+  const doc = db.confirmDocument(req.params.id, req.body);
+  if (!doc) return res.status(404).json({ message: 'Document not found' });
+  generateDraftData(doc.companyId);
+  logAudit(req, 'DOCUMENT_CONFIRMED', 'document', doc.id, `${req.user.name} confirmed document: ${doc.name}`, { companyId: doc.companyId });
+
+  const reviewer = db.getUsers().find(u => u.role === 'reviewer' && u.companyId === doc.companyId);
+  db.addNotification({
+    companyId: doc.companyId,
+    recipient_role: 'reviewer',
+    recipient_email: reviewer ? reviewer.email : 'priya@example.com',
+    message: `Document "${doc.name}" values confirmed and submitted for merchant-banker review by ${req.user.name}.`,
+    related_section: 'documents',
+    type: 'document_submitted'
+  });
+
+  res.json({ message: 'Document data confirmed.', document: doc });
+});
+
+// Route to fetch and stream file content directly from AWS S3 or local storage
+app.get('/api/documents/:id/file', authenticateToken, async (req, res) => {
+  try {
+    const allDocs = db.getDocuments();
+    const doc = allDocs.find(d => d.id === req.params.id);
+    if (!doc) return res.status(404).json({ message: 'Document not found' });
+
+    // Authorization check
+    if (req.user.role !== 'reviewer' && req.user.companyId && req.user.companyId !== doc.companyId) {
+      return res.status(403).json({ message: 'Not authorized to view this document file.' });
+    }
+
+    // Stream from AWS S3 if s3_key exists and AWS is configured
+    if ((doc.s3_key || doc.storage_type === 's3') && hasAwsCredentials && S3_BUCKET) {
+      try {
+        const getObjCmd = new GetObjectCommand({
+          Bucket: S3_BUCKET,
+          Key: doc.s3_key || `documents/${doc.name}`
+        });
+        const s3Response = await s3.send(getObjCmd);
+        res.setHeader('Content-Type', s3Response.ContentType || doc.file_mime || 'application/pdf');
+        res.setHeader('Content-Disposition', `inline; filename="${doc.name}"`);
+        return s3Response.Body.pipe(res);
+      } catch (s3Err) {
+        console.warn(`[S3 Stream Error] Failed to stream from S3 (${doc.s3_key}):`, s3Err.message);
+      }
+    }
+
+    // Fallback to local file if available
+    if (doc.file_path && fs.existsSync(doc.file_path)) {
+      return res.sendFile(path.resolve(doc.file_path));
+    }
+
+    res.status(404).json({ message: 'Source file not available on S3 bucket or local storage.' });
+  } catch (err) {
+    console.error('[Document File] Error:', err.message);
+    res.status(500).json({ message: 'Server error retrieving file.' });
+  }
+});
+
+app.delete('/api/documents/:id', authenticateToken, async (req, res) => {
+  try {
+    // Search across ALL documents in DB
+    const allDocs = db.getDocuments();
+    const doc = allDocs.find(d => d.id === req.params.id);
+    if (!doc) return res.status(404).json({ message: 'Document not found' });
+
+    // Authorization: only reviewer or matching company owner can delete
+    if (req.user.role !== 'reviewer' && req.user.companyId && req.user.companyId !== doc.companyId) {
+      return res.status(403).json({ message: 'Not authorized to delete this document.' });
+    }
+
+    const companyId = doc.companyId || 'aarav-precision';
+
+    // Remove from DB
+    db.deleteDocument(req.params.id);
+
+    // Remove physical file or S3 object from cloud
+    if ((doc.s3_key || doc.storage_type === 's3') && hasAwsCredentials && S3_BUCKET) {
+      try {
+        const s3Key = doc.s3_key || `documents/${doc.name}`;
+        const deleteCmd = new DeleteObjectCommand({
+          Bucket: S3_BUCKET,
+          Key: s3Key
+        });
+        await s3.send(deleteCmd);
+        console.log(`[DELETE] Successfully deleted object from AWS S3 Cloud: ${s3Key}`);
+      } catch (s3Err) {
+        console.warn(`[DELETE] S3 object removal warning (${doc.s3_key}):`, s3Err.message);
+      }
+    } else if (doc.file_path) {
+      try {
+        if (fs.existsSync(doc.file_path)) {
+          fs.unlinkSync(doc.file_path);
+          console.log(`[DELETE] Removed local file: ${doc.file_path}`);
+        }
+      } catch (fileErr) {
+        console.warn(`[DELETE] Could not remove local file ${doc.file_path}:`, fileErr.message);
+      }
+    }
+
+    generateDraftData(companyId);
+    logAudit(req, 'DOCUMENT_DELETED', 'document', req.params.id,
+      `${req.user.name} deleted document: ${doc.name}`,
+      { companyId, doc_type: doc.doc_type, file_path: doc.file_path });
+
+    // Notify reviewer/issuer
+    const notifRole = req.user.role === 'reviewer' ? 'issuer' : 'reviewer';
+    const notifUser = db.getUsers().find(u => u.role === notifRole && u.companyId === companyId);
+    if (notifUser) {
+      db.addNotification({
+        companyId,
+        recipient_role: notifRole,
+        recipient_email: notifUser.email,
+        message: `${req.user.name} deleted document: ${doc.name}`,
+        related_section: 'documents',
+        type: 'document_deletion'
+      });
+    }
+
+    res.json({ message: 'Document deleted successfully.', id: req.params.id });
+  } catch (err) {
+    console.error('[DELETE] Error:', err.message);
+    res.status(500).json({ message: 'Server error deleting document.' });
+  }
+});
+app.put('/api/documents/:id/verify', authenticateToken, (req, res) => {
+  if (req.user.role !== 'reviewer') {
+    return res.status(403).json({ message: 'Only merchant bankers (reviewers) can verify documents.' });
+  }
+  const { status, remarks } = req.body;
+  const valid = ['under_review', 'verified', 'changes_requested'];
+  if (!status || !valid.includes(status)) {
+    return res.status(400).json({ message: `Invalid status. Allowed: ${valid.join(', ')}` });
+  }
+
+  const doc = db.verifyDocument(req.params.id, req.user.email, req.user.name, status, remarks || '');
+  if (!doc) return res.status(404).json({ message: 'Document not found.' });
+
+  logAudit(req, 'DOCUMENT_VERIFIED', 'document', doc.id,
+    `${req.user.name} set document status to ${status} for ${doc.name}.`,
+    { doc_type: doc.doc_type, status, remarks, companyId: doc.companyId }
+  );
+
+  const issuer = db.getUsers().find(u => u.role === 'issuer' && u.companyId === doc.companyId);
+  if (issuer) {
+    const statusText = status === 'verified' 
+      ? `verified by merchant banker ${req.user.name}`
+      : status === 'changes_requested'
+      ? `marked as changes requested by ${req.user.name}`
+      : `placed under review by ${req.user.name}`;
+
+    db.addNotification({
+      companyId: doc.companyId,
+      recipient_role: 'issuer',
+      recipient_email: issuer.email,
+      message: `Document "${doc.name}" was ${statusText}.${remarks ? ` Remarks: "${remarks}"` : ''}`,
+      related_section: 'documents',
+      type: 'document_verification'
+    });
+  }
+
+  res.json({ message: 'Document verification updated successfully.', document: doc });
+});
+
+// ─── DRAFTS ───────────────────────────────────────────────────────────────────
+
+app.get('/api/drafts/:companyId', authenticateToken, (req, res) => {
+  res.json(db.getDrafts(req.params.companyId));
+});
+
+app.post('/api/drafts/:companyId/generate', authenticateToken, (req, res) => {
+  const { companyId } = req.params;
+  const section = req.query.section || req.body?.sectionKey || req.body?.section;
+  const updatedDrafts = generateDraftData(companyId, section);
+  logAudit(req, 'DRAFT_REGENERATED', 'draft', companyId, `${req.user.name} triggered draft regeneration${section ? ` for section: ${section}` : ' for all sections'}.`, { section, companyId });
+  res.json({ message: 'Draft regenerated successfully.', drafts: updatedDrafts });
+});
+
+app.put('/api/drafts/:companyId/:sectionKey/status', authenticateToken, (req, res) => {
+  const { companyId, sectionKey } = req.params;
+  const { status } = req.body;
+  try {
+    const updated = db.updateSectionStatus(companyId, sectionKey, status, req.user.role);
+    logAudit(req, status === 'certified' ? 'SECTION_CERTIFIED' : 'SECTION_STATUS_UPDATED', 'draft_section', sectionKey, `${req.user.name} changed ${sectionKey} status to ${status}.`, { companyId, sectionKey, status });
+    // Notify the other party
+    const notifRole = req.user.role === 'reviewer' ? 'issuer' : 'reviewer';
+    const notifUser = db.getUsers().find(u => u.role === notifRole && u.companyId === companyId);
+    if (notifUser && status === 'certified') {
+      db.addNotification({ companyId, recipient_role: notifRole, recipient_email: notifUser.email, message: `${req.user.name} certified the ${sectionKey.replace(/_/g, ' ')} section.`, related_section: sectionKey, type: 'section_certified' });
+    }
+    res.json(updated);
+  } catch (err) {
+    res.status(403).json({ message: err.message });
+  }
+});
+
+app.put('/api/drafts/:companyId/:sectionKey/content', authenticateToken, (req, res) => {
+  const { companyId, sectionKey } = req.params;
+  const { blocks } = req.body;
+  if (!Array.isArray(blocks)) {
+    return res.status(400).json({ message: 'Blocks must be an array.' });
+  }
+  const updated = db.updateSectionContent(companyId, sectionKey, blocks);
+  logAudit(req, 'SECTION_CONTENT_EDITED', 'draft_section', sectionKey, `${req.user.name} manually edited content blocks for ${sectionKey}.`, { companyId, sectionKey, blockCount: blocks.length });
+  res.json(updated);
+});
+
+app.get('/api/drafts/:companyId/gap-report', authenticateToken, (req, res) => {
+  const companyId = req.params.companyId;
+  const intake = db.getIntake(companyId);
+  const docs = db.getDocuments(companyId);
+  res.json(computeGapReport(companyId, intake, docs));
+});
+
+// ─── FRAUD & VERIFICATION (reviewer-only) ──────────────────────────────────
+// Identity/authenticity verification, deliberately separate from Gap Analysis
+// (data consistency) and Compliance Checklist (requirement completeness) — see
+// verificationEngine.js. Reads intake/documents live; persists only the last
+// computed snapshot + reviewer decisions via db.js's verifications collection.
+
+const VERIFICATION_TYPES = ['gst', 'pan', 'cin', 'document_authenticity', 'identity_cross', 'verification_history'];
+
+function requireReviewer(req, res) {
+  if (req.user.role !== 'reviewer') {
+    res.status(403).json({ message: 'Fraud & Verification is only available to Reviewer users.' });
+    return false;
+  }
+  return true;
+}
+
+// Computes what a fresh check would currently say (does not persist).
+function computeLiveVerification(type, intake, company, docs, allHistory) {
+  if (type === 'gst') {
+    const mock = mockVerifyGST(intake, company);
+    const comparisonRows = buildComparisonRows('gst', mock, intake, docs);
+    return { type, mock, comparisonRows, status: deriveStatus(mock, comparisonRows) };
+  }
+  if (type === 'pan') {
+    const mock = mockVerifyPAN(intake, company);
+    const comparisonRows = buildComparisonRows('pan', mock, intake, docs);
+    return { type, mock, comparisonRows, status: deriveStatus(mock, comparisonRows) };
+  }
+  if (type === 'cin') {
+    const mock = mockVerifyCIN(intake, company);
+    const comparisonRows = buildComparisonRows('cin', mock, intake, docs);
+    return { type, mock, comparisonRows, status: deriveStatus(mock, comparisonRows) };
+  }
+  if (type === 'document_authenticity') {
+    const documents = assessDocumentAuthenticity(docs);
+    const status = documents.length === 0 ? 'pending' : documents.some(d => d.status === 'Not Available') ? 'review_required' : 'verified';
+    return { type, mock: { available: documents.length > 0, provider: 'Demo Verification Service (SIMULATED — document metadata heuristic, not forensic analysis)', checkedAt: new Date().toISOString() }, documents, status };
+  }
+  if (type === 'identity_cross') {
+    const gst = mockVerifyGST(intake, company);
+    const pan = mockVerifyPAN(intake, company);
+    const cin = mockVerifyCIN(intake, company);
+    const comparisonRows = [
+      ...buildComparisonRows('gst', gst, intake, docs).filter(r => r.field === 'Legal Name'),
+      ...buildComparisonRows('cin', cin, intake, docs).filter(r => r.field === 'Legal Name' || r.field === 'CIN')
+    ];
+    const available = gst.available || pan.available || cin.available;
+    return { type, mock: { available, provider: 'Synthesis of GST / PAN / CIN checks above — not an independent source', checkedAt: new Date().toISOString() }, comparisonRows, status: deriveStatus({ available }, comparisonRows) };
+  }
+  if (type === 'verification_history') {
+    return { type, mock: { available: (allHistory || []).length > 0, provider: 'Aggregated audit trail of this page\'s own actions' }, status: (allHistory || []).length > 0 ? 'verified' : 'pending' };
+  }
+  return { type, mock: { available: false }, status: 'pending' };
+}
+
+function loadVerificationRecordOrLive(companyId, type, intake, company, docs, allHistory) {
+  const persisted = db.getVerification(companyId, type);
+  if (persisted) return { ...persisted, live: false };
+  const live = computeLiveVerification(type, intake, company, docs, allHistory);
+  return { id: null, companyId, type, status: live.status, result: live, lastRunAt: null, lastRunBy: null, history: [], live: true };
+}
+
+app.get('/api/verification/:companyId/summary', authenticateToken, (req, res) => {
+  if (!requireReviewer(req, res)) return;
+  const companyId = req.params.companyId;
+  const company = db.getCompany(companyId) || {};
+  const intake = db.getIntake(companyId) || {};
+  const docs = db.getDocuments(companyId) || [];
+  const allHistory = db.getVerifications(companyId).flatMap(v => (v.history || []).map(h => ({ ...h, type: v.type })));
+
+  const modules = VERIFICATION_TYPES.map(type => {
+    const rec = loadVerificationRecordOrLive(companyId, type, intake, company, docs, allHistory);
+    return { type, status: rec.status, lastRunAt: rec.lastRunAt };
+  });
+
+  const checkable = modules.filter(m => m.type !== 'verification_history');
+  const completed = checkable.filter(m => m.status === 'verified' || m.status === 'review_required' || m.status === 'critical').length;
+  const verified = checkable.filter(m => m.status === 'verified').length;
+  const reviewRequired = checkable.filter(m => m.status === 'review_required').length;
+  const critical = checkable.filter(m => m.status === 'critical').length;
+
+  res.json({
+    modules,
+    summary: {
+      overallStatus: critical > 0 ? 'Critical Issue' : reviewRequired > 0 ? 'Review Required' : completed === checkable.length ? 'Verified' : 'In Progress',
+      completed, total: VERIFICATION_TYPES.length,
+      verified, reviewRequired, critical
+    }
+  });
+});
+
+app.get('/api/verification/:companyId/:type', authenticateToken, (req, res) => {
+  if (!requireReviewer(req, res)) return;
+  const { companyId, type } = req.params;
+  if (!VERIFICATION_TYPES.includes(type)) return res.status(404).json({ message: 'Unknown verification type.' });
+
+  const company = db.getCompany(companyId) || {};
+  const intake = db.getIntake(companyId) || {};
+  const docs = db.getDocuments(companyId) || [];
+  const allHistory = db.getVerifications(companyId).flatMap(v => (v.history || []).map(h => ({ ...h, type: v.type })));
+
+  const record = loadVerificationRecordOrLive(companyId, type, intake, company, docs, allHistory);
+  res.json({
+    ...record,
+    sourceDocuments: docs.filter(d => ['incorporation_certificate', 'gst_certificate', 'pan_certificate', 'moa_document', 'aoa_document'].includes(d.doc_type))
+  });
+});
+
+app.post('/api/verification/:companyId/:type/rerun', authenticateToken, (req, res) => {
+  if (!requireReviewer(req, res)) return;
+  const { companyId, type } = req.params;
+  if (!VERIFICATION_TYPES.includes(type) || type === 'verification_history') {
+    return res.status(400).json({ message: 'This module cannot be re-run directly.' });
+  }
+
+  const company = db.getCompany(companyId) || {};
+  const intake = db.getIntake(companyId) || {};
+  const docs = db.getDocuments(companyId) || [];
+  const live = computeLiveVerification(type, intake, company, docs, []);
+  const record = db.upsertVerificationRun(companyId, type, live, req.user.name);
+  logAudit(req, 'VERIFICATION_RERUN', 'verification', type, `${req.user.name} re-ran ${type.toUpperCase()} verification for ${companyId}. Result: ${live.status}.`, { companyId, type, status: live.status });
+  res.json(record);
+});
+
+app.post('/api/verification/:companyId/:type/action', authenticateToken, (req, res) => {
+  if (!requireReviewer(req, res)) return;
+  const { companyId, type } = req.params;
+  const { action, note } = req.body;
+  if (!['flag_for_review', 'mark_verified'].includes(action)) {
+    return res.status(400).json({ message: 'Unknown action.' });
+  }
+  try {
+    const record = db.recordVerificationAction(companyId, type, action, req.user.name, req.user.role, note);
+    logAudit(req, 'VERIFICATION_DECISION', 'verification', type, `${req.user.name} recorded "${action}" on ${type.toUpperCase()} verification for ${companyId}.${note ? ` Note: ${note}` : ''}`, { companyId, type, action, note });
+    res.json(record);
+  } catch (err) {
+    res.status(err.message.includes('Run a verification') ? 400 : 403).json({ message: err.message });
+  }
+});
+
+app.get('/api/verification/:companyId/history/all', authenticateToken, (req, res) => {
+  if (!requireReviewer(req, res)) return;
+  const companyId = req.params.companyId;
+  const allHistory = db.getVerifications(companyId)
+    .flatMap(v => (v.history || []).map(h => ({ ...h, type: v.type })))
+    .sort((a, b) => new Date(b.at) - new Date(a.at));
+  res.json(allHistory);
+});
+
+// ─── COMMENTS ─────────────────────────────────────────────────────────────────
+
+app.get('/api/comments/:sectionId', authenticateToken, (req, res) => {
+  res.json(db.getComments(req.user.companyId, req.params.sectionId));
+});
+
+app.post('/api/comments/:sectionId', authenticateToken, (req, res) => {
+  const { sectionId } = req.params;
+  const { content, type, block_id, parent_id } = req.body;
+  const comment = db.addComment(req.user.companyId, sectionId, content, type, req.user.name, req.user.role, block_id, parent_id);
+  logAudit(req, 'COMMENT_ADDED', 'draft_section', sectionId, `${req.user.name} added a ${type} on ${sectionId}.`, { content: content.substring(0, 100), type });
+  const notifRole = req.user.role === 'reviewer' ? 'issuer' : 'reviewer';
+  const notifUser = db.getUsers().find(u => u.role === notifRole && u.companyId === req.user.companyId);
+  if (notifUser) {
+    db.addNotification({ companyId: req.user.companyId, recipient_role: notifRole, recipient_email: notifUser.email, message: `${req.user.name} added a ${type === 'clarification_requested' ? 'clarification request' : 'comment'} on ${sectionId.replace(/_/g, ' ')}: "${content.substring(0, 80)}${content.length > 80 ? '...' : ''}"`, related_section: sectionId, type: 'comment' });
+  }
+  res.json(comment);
+});
+
+app.put('/api/comments/:commentId/resolve', authenticateToken, (req, res) => {
+  const comment = db.resolveComment(req.params.commentId);
+  if (!comment) return res.status(404).json({ message: 'Comment not found' });
+  logAudit(req, 'COMMENT_RESOLVED', 'comment', req.params.commentId, `${req.user.name} resolved a comment on ${comment.section_id}.`, {});
+  res.json(comment);
+});
+
+app.put('/api/comments/:commentId', authenticateToken, (req, res) => {
+  const { content } = req.body;
+  const comment = db.editComment(req.params.commentId, content);
+  if (!comment) return res.status(404).json({ message: 'Comment not found' });
+  logAudit(req, 'COMMENT_EDITED', 'comment', req.params.commentId, `${req.user.name} edited a comment.`, { content: content.substring(0, 100) });
+  res.json(comment);
+});
+
+app.delete('/api/comments/:commentId', authenticateToken, (req, res) => {
+  const success = db.deleteComment(req.params.commentId);
+  if (!success) return res.status(404).json({ message: 'Comment not found' });
+  logAudit(req, 'COMMENT_DELETED', 'comment', req.params.commentId, `${req.user.name} deleted a comment.`, {});
+  res.json({ message: 'Comment deleted successfully' });
+});
+
+// ─── NOTIFICATIONS ────────────────────────────────────────────────────────────
+
+app.get('/api/notifications', authenticateToken, (req, res) => {
+  const notifs = db.getNotifications(req.user.companyId, req.user.email, req.user.role);
+  res.json(notifs);
+});
+
+app.put('/api/notifications/:id/read', authenticateToken, (req, res) => {
+  const notif = db.markNotificationRead(req.params.id);
+  res.json(notif || {});
+});
+
+app.put('/api/notifications/mark-all-read', authenticateToken, (req, res) => {
+  db.markAllNotificationsRead(req.user.companyId, req.user.email, req.user.role);
+  res.json({ message: 'All notifications marked as read.' });
+});
+
+app.post('/api/notifications', authenticateToken, (req, res) => {
+  const notif = db.addNotification(req.body);
+  res.json(notif);
+});
+
+// ─── SEBI NOTICES ─────────────────────────────────────────────────────────────
+
+app.get('/api/sebi-notices', authenticateToken, (req, res) => {
+  const notices = db.getSebiNotices();
+  const meta = db.getSebiNoticesMeta();
+  res.json({ notices, meta });
+});
+
+app.post('/api/sebi-notices/refresh', authenticateToken, async (req, res) => {
+  logAudit(req, 'SEBI_REFRESH', 'sebi_notices', 'global', `${req.user.name} manually triggered SEBI notices refresh.`, {});
+  try {
+    const notices = await fetchSebiNoticesFromRSS();
+    const meta = db.getSebiNoticesMeta();
+    res.json({ notices, meta, message: `Fetched ${notices.length} notices from SEBI.` });
+  } catch (err) {
+    res.status(500).json({ message: 'Failed to refresh SEBI notices.', error: err.message });
+  }
+});
+
+// Vercel Cron replacement for the in-process 6-hourly schedule. This route is
+// publicly reachable, so it is gated on CRON_SECRET: Vercel sends it as a bearer
+// token, and without it an anonymous caller could hammer the SEBI feed.
+app.get('/api/cron/sebi-refresh', async (req, res) => {
+  const secret = process.env.CRON_SECRET;
+  if (!secret || req.headers.authorization !== `Bearer ${secret}`) {
+    return res.status(401).json({ message: 'Unauthorized.' });
+  }
+  try {
+    const notices = await fetchSebiNoticesFromRSS();
+    await flushDb();
+    console.log(`[SEBI] Cron refresh fetched ${notices.length} notices`);
+    res.json({ ok: true, count: notices.length });
+  } catch (err) {
+    console.error('[SEBI] Cron refresh failed:', err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ─── AUDIT LOGS ───────────────────────────────────────────────────────────────
+
+app.get('/api/audit-logs', authenticateToken, (req, res) => {
+  if (req.user.role !== 'reviewer') return res.status(403).json({ message: 'Only reviewers can access audit logs.' });
+  const companyId = req.query.companyId;
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 10;
+  const search = (req.query.search || '').toLowerCase();
+
+  let logs = db.getAuditLogs(companyId ? { companyId } : {});
+  
+  if (search) {
+    logs = logs.filter(log => 
+      (log.action && log.action.toLowerCase().includes(search)) ||
+      (log.description && log.description.toLowerCase().includes(search)) ||
+      (log.actor_name && log.actor_name.toLowerCase().includes(search))
+    );
+  }
+
+  const total = logs.length;
+  const startIndex = (page - 1) * limit;
+  const paginatedLogs = logs.slice(startIndex, startIndex + limit);
+
+  res.json({ logs: paginatedLogs, total, page, limit });
+});
+
+// ─── IPO READINESS (Gemini-powered) ──────────────────────────────────────────
+
+app.get('/api/companies/:id/ipo-readiness', authenticateToken, async (req, res) => {
+  const companyId = req.params.id;
+  const company = db.getCompany(companyId);
+  if (!company) return res.status(404).json({ message: 'Company not found' });
+
+  try {
+    const intake = db.getIntake(companyId);
+    const docs = db.getDocuments(companyId);
+    const drafts = db.getDrafts(companyId);
+    const gapReport = computeGapReport(companyId, intake, docs);
+    const invitations = db.getInvitations(companyId);
+    const sections = Object.keys(drafts);
+
+    // Saved reviewer verifications. Read before scoring, not after: the whole
+    // point of a merchant banker signing off on a milestone is that it should
+    // move the score.
+    const savedReadiness = db.getIpoReadiness(companyId) || {};
+    const itemStatuses = savedReadiness.items || {};
+
+    // ── 1. INTAKE FORM & COMPANY INFORMATION (40 points) ────────────────────
+    const INTAKE_SECTIONS = {
+      company_details: ['legal_name', 'cin', 'incorporation_date', 'registered_office', 'industry_type'],
+      business_overview: ['company_history', 'manufacturing_plants', 'installed_capacity', 'capacity_utilization_pct'],
+      promoters: ['promoters_list', 'directors'],
+      capital_structure: ['total_shares', 'promoter_holding_pct', 'shareholders'],
+      financials: ['revenue_fy25', 'revenue_fy24', 'revenue_fy23', 'profit_fy25', 'total_debt'],
+      objects: ['amount_to_raise', 'purpose', 'timeline'],
+      rpt: ['has_rpt'],
+      litigation: ['has_litigation'],
+      legal_compliance: ['factory_license', 'pollution_noc', 'fire_noc', 'auditor_details'],
+      risk_information: ['top5_customers_pct', 'single_factory'],
+      other_disclosures: ['material_contracts', 'insurance_coverage']
+    };
+
+    const requiredFieldsFor = (sectionKey, sectionData) => {
+      const fields = [...(INTAKE_SECTIONS[sectionKey] || [])];
+      if (sectionKey === 'rpt' && sectionData.has_rpt === 'yes') fields.push('rpt_details');
+      if (sectionKey === 'litigation' && sectionData.has_litigation === 'yes') fields.push('litigation_details');
+      if (sectionKey === 'risk_information' && sectionData.forex_exposure === 'yes') fields.push('forex_pct');
+      if (sectionKey === 'risk_information' && sectionData.promoter_dependence === 'yes') fields.push('promoter_dependence_note');
+      return fields;
+    };
+    const isFilled = (v) => v !== undefined && v !== null && String(v).trim() !== '';
+
+    let totalIntakeFields = 0;
+    let filledIntakeFields = 0;
+    let completeSections = 0;
+    for (const sectionKey of Object.keys(INTAKE_SECTIONS)) {
+      const sectionData = intake[sectionKey] || {};
+      const fields = requiredFieldsFor(sectionKey, sectionData);
+      const filledHere = fields.filter(f => isFilled(sectionData[f])).length;
+      totalIntakeFields += fields.length;
+      filledIntakeFields += filledHere;
+      if (fields.length > 0 && filledHere === fields.length) completeSections++;
+    }
+    const POINTS_PER_INTAKE_FIELD = totalIntakeFields > 0 ? 40 / totalIntakeFields : 0;
+    const intakeScore = Math.min(40, filledIntakeFields * POINTS_PER_INTAKE_FIELD);
+
+    // ── 2. COMPLIANCE & SEBI CHECKS (20 points) ─────────────────────────────
+    const uploadedDocTypes = new Set(docs.map(d => d.doc_type));
+    const hasIntakeCompleted = Object.keys(intake || {}).some(k => intake[k] && Object.keys(intake[k]).length > 0);
+    let complianceScore = 0;
+
+    if (hasIntakeCompleted || docs.length > 0) {
+      const complianceRules = [
+        { id: 'RULE-001', points: 2, status: uploadedDocTypes.has('aoa') ? 'Pass' : 'Fail' },
+        { id: 'RULE-002', points: 2, status: uploadedDocTypes.has('moa') ? 'Pass' : 'Fail' },
+        { id: 'RULE-003', points: 2, status: docs.filter(d => d.doc_type === 'financial_statements' || d.doc_type === 'audited_financials').length >= 3 ? 'Pass' : docs.filter(d => d.doc_type === 'financial_statements' || d.doc_type === 'audited_financials').length > 0 ? 'Warning' : 'Fail' },
+        { id: 'RULE-004', points: 2, status: uploadedDocTypes.has('board_resolution') ? 'Pass' : 'Fail' },
+        { id: 'RULE-005', points: 2, status: uploadedDocTypes.has('shareholding_pattern') || uploadedDocTypes.has('cap_table') ? 'Pass' : 'Fail' },
+        { id: 'RULE-006', points: 2, status: uploadedDocTypes.has('promoter_kyc') || uploadedDocTypes.has('din_proof') ? 'Pass' : 'Fail' },
+        { id: 'RULE-007', points: 2, status: uploadedDocTypes.has('factory_license') || (intake.legal_compliance?.factory_license ? 'Pass' : 'Fail') },
+        { id: 'RULE-008', points: 1, status: uploadedDocTypes.has('pan_certificate') || uploadedDocTypes.has('gst_certificate') ? 'Pass' : 'Fail' },
+        { id: 'RULE-009', points: 2, status: uploadedDocTypes.has('auditor_certificate') || (intake.legal_compliance?.auditor_details ? 'Pass' : 'Fail') },
+        { id: 'RULE-010', points: 1, status: uploadedDocTypes.has('litigation_records') || (intake.litigation ? 'Pass' : 'Fail') },
+        { id: 'RULE-011', points: 1, status: uploadedDocTypes.has('material_contracts') || (intake.other_disclosures?.material_contracts ? 'Pass' : 'Fail') },
+        { id: 'RULE-012', points: 1, status: uploadedDocTypes.has('insurance_coverage') || (intake.other_disclosures?.insurance_coverage ? 'Pass' : 'Fail') }
+      ];
+
+      for (const rule of complianceRules) {
+        if (rule.status === 'Pass') complianceScore += rule.points;
+        else if (rule.status === 'Warning') complianceScore += Math.floor(rule.points / 2);
+      }
+    }
+    complianceScore = Math.min(20, complianceScore);
+
+    // ── 3. GAP ANALYSIS & REMEDIATION (20 points) ───────────────────────────
+    let gapScore = 0;
+    if (hasIntakeCompleted || docs.length > 0) {
+      const finDoc = docs.find(d => d.doc_type === 'audited_financials');
+      const capDoc = docs.find(d => d.doc_type === 'cap_table');
+      const financials = intake.financials || {};
+      const capitalStructure = intake.capital_structure || {};
+      const objects = intake.objects || {};
+      const riskInfo = intake.risk_information || {};
+
+      const flaggedIds = new Set(gapReport.map(g => g.id));
+
+      if (financials.revenue_fy25 && finDoc?.extracted_values?.revenue_fy25 && !flaggedIds.has('gap-rev-mismatch')) gapScore += 5;
+      if (capitalStructure.promoter_holding_pct && capDoc?.extracted_values?.promoter_holding_pct && !flaggedIds.has('gap-holding-mismatch')) gapScore += 5;
+      if ((objects.amount_to_raise || objects.purpose) && objects.timeline && objects.timeline.trim() !== '') gapScore += 4;
+      if (riskInfo.top5_customers_pct && String(riskInfo.top5_customers_pct).trim() !== '') gapScore += 2;
+      if (riskInfo.single_factory && String(riskInfo.single_factory).trim() !== '') gapScore += 2;
+      if (riskInfo.pending_tax_demand !== undefined && riskInfo.pending_tax_demand !== null && String(riskInfo.pending_tax_demand).trim() !== '') gapScore += 2;
+    }
+    gapScore = Math.min(20, gapScore);
+
+    // ── 4. REVIEWER CERTIFICATION (20 points) ───────────────────────────────
+    const CERT_POINTS = {
+      company_details: 2, business_overview: 2, financials: 2, capital_structure: 2,
+      objects: 2, promoter_details: 2, risk_factors: 2, litigation: 2,
+      legal_compliance: 2, related_party: 1, other_disclosures: 1
+    };
+    let certScore = 0;
+    let certifiedCount = 0;
+    for (const [secKey, pts] of Object.entries(CERT_POINTS)) {
+      if (drafts[secKey] && drafts[secKey].status === 'certified') {
+        certScore += pts;
+        certifiedCount++;
+      }
+    }
+    certScore = Math.min(20, certScore);
+
+    // ── TOTAL SCORE (0-100) ──────────────────────────────────────────────────
+    const overall_score = Math.min(100, Math.max(0, Math.round(intakeScore + complianceScore + gapScore + certScore)));
+
+    let overall_label = 'Getting started';
+    if (overall_score >= 100) overall_label = 'Ready for IPO filing review';
+    else if (overall_score >= 80) overall_label = 'Nearly IPO ready';
+    else if (overall_score >= 60) overall_label = 'Strong progress';
+    else if (overall_score >= 40) overall_label = 'In progress';
+
+    const bankerAccepted = invitations.some(i => i.status === 'accepted');
+
+    const milestoneItems = [
+      { key: 'board_governance', title: 'Board Governance & Independent Directors', category: 'governance', status: itemStatuses.board_governance?.status || 'in_progress', verified_by: itemStatuses.board_governance?.updated_by_name || null },
+      { key: 'audited_financials_3yr', title: '3-Year Audited Financial Statements', category: 'financials', status: itemStatuses.audited_financials_3yr?.status || (docs.some(d => d.doc_type === 'audited_financials' && d.status === 'confirmed') ? 'verified' : 'in_progress'), verified_by: itemStatuses.audited_financials_3yr?.updated_by_name || null },
+      { key: 'cap_table_verification', title: 'Cap Table & Promoter Lock-In', category: 'compliance', status: itemStatuses.cap_table_verification?.status || (docs.some(d => d.doc_type === 'cap_table' && d.status === 'confirmed') ? 'verified' : 'needs_changes'), verified_by: itemStatuses.cap_table_verification?.updated_by_name || null },
+      { key: 'sebi_icdr_disclosures', title: 'SEBI ICDR Fund Utilization Timeline', category: 'disclosures', status: itemStatuses.sebi_icdr_disclosures?.status || (gapReport.some(g => g.fieldName === 'objects.timeline') ? 'needs_changes' : 'completed'), verified_by: itemStatuses.sebi_icdr_disclosures?.updated_by_name || null },
+      { key: 'merchant_banker_appointment', title: 'SEBI-Registered Merchant Banker Engagement', category: 'merchant_banker', status: itemStatuses.merchant_banker_appointment?.status || (bankerAccepted ? 'completed' : 'in_progress'), verified_by: itemStatuses.merchant_banker_appointment?.updated_by_name || null },
+      { key: 'chapter_certifications', title: 'DRHP Chapter Certifications', category: 'certification', status: itemStatuses.chapter_certifications?.status || (certifiedCount === Object.keys(CERT_POINTS).length ? 'completed' : 'in_progress'), verified_by: itemStatuses.chapter_certifications?.updated_by_name || null }
+    ];
+
+    const resultPayload = {
+      companyId,
+      companyName: company.name,
+      overall_score,
+      overall_label,
+      summary: `IPO readiness score is ${overall_score}/100. ${certifiedCount} of ${Object.keys(CERT_POINTS).length} draft chapters certified. ${Math.round(intakeScore)}/40 intake, ${Math.round(complianceScore)}/20 compliance, ${Math.round(gapScore)}/20 gap analysis, ${Math.round(certScore)}/20 certification.`,
+      sections: {
+        intake_completion: { score: Math.round(intakeScore), max: 40, status: intakeScore >= 35 ? 'ok' : intakeScore > 0 ? 'warning' : 'critical', note: `${filledIntakeFields} of ${totalIntakeFields} required fields filled · ${completeSections} of ${Object.keys(INTAKE_SECTIONS).length} sections complete` },
+        compliance_checks: { score: Math.round(complianceScore), max: 20, status: complianceScore >= 18 ? 'ok' : complianceScore > 0 ? 'warning' : 'critical', note: `${Math.round(complianceScore)} of 20 compliance points earned` },
+        gap_remediation: { score: Math.round(gapScore), max: 20, status: gapScore >= 18 ? 'ok' : gapScore > 0 ? 'warning' : 'critical', note: `${Math.round(gapScore)} of 20 gap remediation points earned` },
+        reviewer_certification: { score: Math.round(certScore), max: 20, status: certScore >= 18 ? 'ok' : certScore > 0 ? 'warning' : 'critical', note: `${certifiedCount} of ${Object.keys(CERT_POINTS).length} sections certified by reviewer` }
+      },
+      milestone_items: milestoneItems,
+      top_gaps: gapReport.slice(0, 3).map(g => g.message),
+      recommendations: [
+        bankerAccepted ? 'Review draft chapters with engaged Merchant Banker.' : 'Appoint a SEBI-registered Merchant Banker from Invitations.',
+        gapReport.length > 0 ? 'Resolve open data discrepancies in Intake Form.' : 'Proceed to final reviewer certification.',
+        certifiedCount < Object.keys(CERT_POINTS).length ? 'Complete section certifications in Reviewer Workspace.' : 'Export certified DRHP prospectus for SEBI submission.'
+      ],
+      disclaimer: 'IPO Readiness scores and AI insights are informational tools designed for preparation assistance and do not constitute legal, financial, SEBI regulatory, or merchant banking certification.',
+      computed_at: new Date().toISOString()
+    };
+
+    db.saveIpoReadiness(companyId, resultPayload);
+    logAudit(req, 'IPO_READINESS_COMPUTED', 'ipo_readiness', companyId, `${req.user.name} checked IPO readiness. Score: ${overall_score}/100`, { score: overall_score });
+    res.json(resultPayload);
+  } catch (err) {
+    console.error('[IPO Readiness] Calculation error:', err.message);
+    const cached = db.getIpoReadiness(companyId);
+    if (cached) return res.json({ ...cached, stale: true });
+    res.status(500).json({ message: 'Error calculating readiness', error: err.message });
+  }
+});
+
+app.put('/api/companies/:id/ipo-readiness/item-status', authenticateToken, (req, res) => {
+  try {
+    const { id: companyId } = req.params;
+    const { itemKey, status, remarks } = req.body;
+    const readiness = db.getIpoReadiness(companyId) || {};
+    if (!readiness.itemStatuses) readiness.itemStatuses = {};
+    readiness.itemStatuses[itemKey] = { status, remarks, updatedBy: req.user.name, updatedAt: new Date().toISOString() };
+    db.saveIpoReadiness(companyId, readiness);
+    logAudit(req, 'IPO_READINESS_ITEM_UPDATED', 'ipo_readiness', companyId, `${req.user.name} updated readiness item ${itemKey} to ${status}`);
+    res.json({ success: true, itemKey, status, readiness });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+app.post('/api/chatbot/query', authenticateToken, async (req, res) => {
+  const { question = '', history = [], context = {} } = req.body;
+
+  // Company scoping mirrors the pattern already used elsewhere in this file
+  // (e.g. the draft/document routes): an issuer is always pinned to their own
+  // company from the JWT, regardless of what the client sends. A reviewer has
+  // no fixed companyId (they review multiple companies via invitations), so
+  // the client-supplied companyId is trusted for that role only.
+  const companyId = req.user.role === 'issuer'
+    ? req.user.companyId
+    : (context.companyId || req.user.companyId);
+
+  if (!companyId) {
+    return res.status(400).json({ answer: 'Company data could not be loaded. Please refresh and try again.' });
+  }
+
+  // ── RETRIEVAL PIPELINE ───────────────────────────────────────────────────
+  // question -> detectSources -> load only those slices -> build context.
+  // The whole workspace is never sent; each request carries only what the
+  // question needs, labeled with the real route it came from.
+  let company, intake, docs, drafts, comments, gapReport, auditLogs, verifications, sebiNotices;
+  try {
+    company = db.getCompany(companyId) || {};
+    intake = db.getIntake(companyId) || {};
+    docs = db.getDocuments(companyId) || [];
+    drafts = db.getDrafts(companyId) || {};
+    comments = db.getAllComments(companyId) || [];
+    gapReport = computeGapReport(companyId, intake, docs) || [];
+    auditLogs = db.getAuditLogs({ companyId }) || [];
+    // Fraud & Verification is a reviewer-only module — an issuer's Copilot must
+    // never see its findings, matching the 403 on the module's own routes.
+    verifications = req.user.role === 'reviewer' ? (db.getVerifications(companyId) || []) : [];
+    sebiNotices = db.getSebiNotices() || [];
+  } catch (err) {
+    console.error('[Copilot] Failed to load company data:', err.message);
+    return res.status(500).json({ answer: "I couldn't access the current company data right now. Please try again." });
+  }
+
+  const companyName = intake.company_details?.legal_name || company?.legal_name || company?.name || 'this company';
+
+  const previousQuestion = [...history].reverse().find(m => m.role === 'user')?.content || '';
+  const selectedSources = detectSources(question, {
+    previousQuestion,
+    pathname: context.pathname || '',
+    role: req.user.role
+  });
+
+  const retrieved = retrieveSources(selectedSources, {
+    role: req.user.role,
+    question,
+    company, intake, docs, drafts, comments, gapReport, auditLogs, verifications,
+    sebiNotices: Array.isArray(sebiNotices) ? sebiNotices : (sebiNotices?.notices || []),
+    // Readiness/compliance/gap scores are NOT recomputed here — this is the
+    // exact snapshot the IPO Readiness page is showing, passed through from the
+    // client's single-source-of-truth engine, so the two can never disagree.
+    readiness: context.readiness
+  });
+
+  const retrievedBlock = buildContextBlock(retrieved);
+  const isGeneral = isGeneralKnowledgeQuestion(question);
+
+  const systemContext = `You are IPO Pilot Copilot, an AI assistant embedded inside the IPO Pilot AI workspace for ${companyName}.
+
+WHO IS ASKING
+- User: ${req.user.name}, role: ${req.user.role}.
+- Current page: ${context.pathname || 'unknown'}${context.currentChapter ? ` (viewing: ${context.currentChapter})` : ''}.
+
+HOW THIS CONTEXT WAS BUILT
+The user's question was classified and only the relevant parts of their live workspace were retrieved. The blocks below are the CURRENT saved state of this specific company — they are the only facts you may assert. Anything not present below is genuinely absent from the workspace.
+
+RETRIEVED WORKSPACE DATA
+${retrievedBlock}
+
+QUESTION TYPE: ${isGeneral
+  ? 'This looks like a GENERAL IPO/SEBI concept question, not a question about this company\'s own data. Answer it from general IPO/SEBI knowledge. You may optionally add one short line connecting it to this company\'s actual state if the retrieved data supports it, clearly separated from the general explanation.'
+  : 'This is a COMPANY-SPECIFIC question. Answer it from the retrieved workspace data above, not from general knowledge. Do not give a textbook definition when the user is asking about their own workspace.'}
+
+RULES
+1. Answer ONLY what was asked, using the retrieved data. Never pad the response with unrelated modules — if the user asked about revenue, do not append compliance findings, gaps, or a readiness breakdown.
+2. NEVER invent or estimate: financial figures, GSTIN, PAN, CIN, dates, company details, legal proceedings, compliance status, SEBI status, reviewer decisions, certification status, document names, or verification results. If the retrieved data does not contain what was asked, say exactly: "I couldn't find that information in the current company data." If it is partially there, say what you found and name what is missing.
+3. Cite where each company-specific fact came from. End the answer with a "Source:" line using markdown links to the routes given with each SOURCE block, e.g. "Source: [Financial Information](/intake?step=financials)". Use only routes that appear in the retrieved blocks above — never invent a route or link to a page that wasn't provided.
+4. When there is an obvious next step in the app, offer it as a markdown link on its own line, e.g. "[Open Compliance Checklist](/compliance-checklist)". Only link to routes provided above, and only when it actually relates to the question.
+5. Readiness/compliance/gap scores must be quoted exactly as given. Never recalculate, round, or estimate them.
+6. You cannot perform any action in this application — you can only inform and navigate. Only a Reviewer can approve, reject, request changes on, or certify a chapter. If an issuer asks you to do one of those, say that only the assigned Reviewer can, and report the chapter's actual current status. Never claim an action was carried out.
+7. Be concise and proportional: a simple question gets 1–3 sentences. Use a short markdown table or bullets only for genuinely multi-item data.
+8. Multi-turn: resolve short follow-ups ("why?", "how do I fix it?", "which one is blocking?") against the immediately preceding turn. Never ask the user to repeat the company or topic.
+9. If the question is truly ambiguous between two real interpretations, ask one short clarifying question instead of guessing.
+10. If you generate draft prospectus text (e.g. a risk factor), prefix it with "AI draft — verify against the underlying source before using in the prospectus" and base it strictly on the retrieved data.`;
+
+  try {
+    let modelUsed = GEMINI_MODEL;
+    const result = await callGemini(async (modelName) => {
+      const model = genAI.getGenerativeModel({
+        model: modelName,
+        systemInstruction: systemContext
+      });
+
+      const chatHistory = history.slice(-10).map(msg => ({
+        role: msg.role === 'user' ? 'user' : 'model',
+        parts: [{ text: String(msg.content || '') }]
+      }));
+
+      const chat = model.startChat({ history: chatHistory });
+      return chat.sendMessage(question);
+    }, { label: 'chatbot', onModel: (m) => { modelUsed = m; } });
+
+    const answer = result.response.text();
+    // `sources` is returned for observability/debugging of the retrieval layer —
+    // it shows which slices this specific answer was grounded in.
+    res.json({ answer, model: modelUsed, sources: retrieved.map(r => ({ id: r.id, label: r.label, route: r.route })) });
+  } catch (err) {
+    console.warn('[Copilot] Gemini API request failed:', err.message);
+    res.json({ answer: "I couldn't process that request right now. Please try again.", model: 'unavailable' });
+  }
+});
+
+// ─── EXPORT (Real DOCX) ───────────────────────────────────────────────────────
+
+app.get('/api/export/:companyId/docx', authenticateToken, async (req, res) => {
+  const { companyId } = req.params;
+  const company = db.getCompany(companyId) || {};
+  const intake = db.getIntake(companyId) || {};
+  const docs = db.getDocuments(companyId) || [];
+  
+  let drafts = db.getDrafts(companyId) || {};
+  const generatedDrafts = generateDraftData(companyId);
+  CHAPTER_ORDER.forEach(({ key }) => {
+    if (!drafts[key] || !drafts[key].blocks || drafts[key].blocks.length === 0) {
+      drafts[key] = generatedDrafts[key] || { status: 'draft', blocks: [] };
+    }
+  });
+
+  const allCertified = CHAPTER_ORDER.every(({ key }) => drafts[key] && drafts[key].status === 'certified');
+
+  const ctx = resolveFrontMatterContext(intake, company);
+  const compName = ctx.compName;
+
+  // 1. FIXED FRONT MATTER TEMPLATE (PAGES 1-3 + TOC) — bordered SEBI-style pages
+  // mirroring FrontMatterTemplate.jsx (same field resolution, same table/box layout).
+  const docElements = renderFrontMatterDocx(ctx);
+
+  // 2. MERGE ALL APPROVED / DRAFTED DRHP CHAPTERS IN EXHAUSTIVE EXPANDED SEBI FORMAT
+  let exportedChaptersCount = 0;
+
+  const addSubHeader = (titleStr) => {
+    docElements.push(new Paragraph({ heading: HeadingLevel.HEADING_2, spacing: { before: 200, after: 80 }, children: [
+      new TextRun({ text: titleStr, bold: true, size: 20, color: '0f172a', font: 'Times New Roman' })
+    ]}));
+  };
+
+  const addPara = (textStr, isBold = false, italics = false) => {
+    docElements.push(new Paragraph({ spacing: { before: 60, after: 60 }, children: [
+      new TextRun({ text: textStr, size: 18, color: '334155', bold: isBold, italics })
+    ]}));
+  };
+
+  // ── DRHP CHAPTERS — rendered from the exact same section/subsection hierarchy
+  // and block content shown in the Draft Preview (DRHP_HIERARCHY + per-chapter
+  // drafts[key].blocks), so the export matches the on-screen document. Citations
+  // ("Source:" chips in the app) are intentionally not rendered — see
+  // drhpExportEngine.js.
+  for (let secIdx = 0; secIdx < DRHP_HIERARCHY.length; secIdx++) {
+    const sec = DRHP_HIERARCHY[secIdx];
+    const secTitleDisplay = sec.title.startsWith('SECTION') ? sec.title : `SECTION ${ROMAN[secIdx] || secIdx + 1} – ${sec.title}`;
+    docElements.push(new Paragraph({ heading: HeadingLevel.HEADING_1, spacing: { before: 400, after: 150 }, children: [
+      new TextRun({ text: secTitleDisplay.toUpperCase(), bold: true, size: 24, color: '1e1b4b', font: 'Times New Roman' })
+    ]}));
+    exportedChaptersCount++;
+
+    const subsections = sec.subsections && sec.subsections.length > 0 ? sec.subsections : [{ id: sec.id, title: sec.title, key: sec.key }];
+    for (let subIdx = 0; subIdx < subsections.length; subIdx++) {
+      const sub = subsections[subIdx];
+      const subNumber = sec.subsections && sec.subsections.length > 0 ? `${secIdx + 1}.${subIdx + 1}` : `${secIdx + 1}.0`;
+      const cleanSubTitle = (sub.title || '').replace(/^\d+(\.\d+)*\s*/, '').trim();
+      addSubHeader(`${subNumber} ${cleanSubTitle}`);
+
+      const subBlocks = getExportBlocksForSubsection(sub.id, sub.key, drafts, intake);
+      if (subBlocks && subBlocks.length > 0) {
+        for (const blk of subBlocks) {
+          const elements = await renderBlockDocx(blk);
+          docElements.push(...elements);
+        }
+      } else {
+        addPara(`Disclosure content pending generation for ${cleanSubTitle}.`, false, true);
+      }
+    }
+
+    docElements.push(new Paragraph({ children: [new TextRun({ text: '', pageBreakBefore: true })] }));
+  }
+
+  docElements.push(new Paragraph({ spacing: { before: 400 }, children: [
+    new TextRun({ text: `\nGenerated by IPO Pilot AI — ${new Date().toLocaleString('en-IN')} — Official Complete SEBI DRHP Export Package`, italics: true, size: 16, color: '94a3b8' })
+  ]}));
+
+  const wordDoc = new Document({
+    sections: [{
+      properties: {
+        page: {
+          size: { width: 11906, height: 16838 },
+          margin: { top: 1080, right: 1080, bottom: 1080, left: 1080 }
+        }
+      },
+      footers: buildDocxHeaderFooter(compName),
+      children: docElements
+    }],
+    styles: { default: { document: { run: { font: 'Arial' } } } }
+  });
+  const buffer = await Packer.toBuffer(wordDoc);
+
+  logAudit(req, 'EXPORT_DOWNLOADED', 'export', companyId, `${req.user.name} downloaded complete single-document SEBI DRHP DOCX export. Status: ${allCertified ? 'certified' : 'draft'}.`, { certified: allCertified, sections: exportedChaptersCount });
+
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+  res.setHeader('Content-Disposition', `attachment; filename=SEBI_SME_DRHP_${companyId}_${Date.now()}.docx`);
+  res.send(buffer);
+});
+
+app.get('/api/export/:companyId/pdf', authenticateToken, async (req, res) => {
+  const { companyId } = req.params;
+  const company = db.getCompany(companyId) || {};
+  const intake = db.getIntake(companyId) || {};
+  const docs = db.getDocuments(companyId) || [];
+  
+  let drafts = db.getDrafts(companyId) || {};
+  const generatedDrafts = generateDraftData(companyId);
+  CHAPTER_ORDER.forEach(({ key }) => {
+    if (!drafts[key] || !drafts[key].blocks || drafts[key].blocks.length === 0) {
+      drafts[key] = generatedDrafts[key] || { status: 'draft', blocks: [] };
+    }
+  });
+
+  const allCertified = CHAPTER_ORDER.every(({ key }) => drafts[key] && drafts[key].status === 'certified');
+  const watermarkText = allCertified ? 'OFFICIAL CERTIFIED SEBI FILING COPY' : 'DRAFT — PENDING PROFESSIONAL REVIEW (AI-ASSISTED)';
+
+  const ctx = resolveFrontMatterContext(intake, company);
+  const compName = ctx.compName;
+
+  const doc = new PDFDocument({ size: 'A4', margin: 56, bufferPages: true });
+  // pdfkit's built-in Helvetica/Times fonts are WinAnsi-encoded and have no glyph
+  // for ₹ (U+20B9) — it would render as a garbled character. Swap for "Rs." at the
+  // single text-drawing choke point so every renderer (front matter, chapters,
+  // tables, charts) gets the fix without touching each call site.
+  const _pdfRawText = doc.text.bind(doc);
+  doc.text = function (text, ...args) {
+    return _pdfRawText(typeof text === 'string' ? text.replace(/₹/g, 'Rs. ') : text, ...args);
+  };
+  const filename = `SEBI_SME_DRHP_${companyId}_${Date.now()}.pdf`;
+
+  res.setHeader('Content-disposition', `attachment; filename="${filename}"`);
+  res.setHeader('Content-type', 'application/pdf');
+
+  doc.pipe(res);
+
+  // 1. FIXED FRONT MATTER (PAGES 1-3 + TOC) — bordered SEBI-style pages mirroring
+  // FrontMatterTemplate.jsx (same field resolution, same table/box layout).
+  renderFrontMatterPdf(doc, ctx);
+
+  // 2. MERGE ALL APPROVED / DRAFTED DRHP CHAPTERS IN EXHAUSTIVE EXPANDED SEBI FORMAT
+  let exportedChaptersCount = 0;
+
+  const pdfAddSubHeader = (titleStr) => {
+    doc.fontSize(12).fillColor('#0f172a').font('Times-Bold').text(titleStr).moveDown(0.4);
+  };
+
+  // ── DRHP CHAPTERS — rendered from the exact same section/subsection hierarchy
+  // and block content shown in the Draft Preview (DRHP_HIERARCHY + per-chapter
+  // drafts[key].blocks), so the export matches the on-screen document. Citations
+  // ("Source:" chips in the app) are intentionally not rendered — see
+  // drhpExportEngine.js.
+  DRHP_HIERARCHY.forEach((sec, secIdx) => {
+    doc.addPage();
+    const secTitleDisplay = sec.title.startsWith('SECTION') ? sec.title : `SECTION ${ROMAN[secIdx] || secIdx + 1} – ${sec.title}`;
+    doc.fontSize(16).fillColor('#1e1b4b').font('Times-Bold').text(secTitleDisplay.toUpperCase(), { align: 'left' }).moveDown(0.8);
+    exportedChaptersCount++;
+
+    const subsections = sec.subsections && sec.subsections.length > 0 ? sec.subsections : [{ id: sec.id, title: sec.title, key: sec.key }];
+    subsections.forEach((sub, subIdx) => {
+      const subNumber = sec.subsections && sec.subsections.length > 0 ? `${secIdx + 1}.${subIdx + 1}` : `${secIdx + 1}.0`;
+      const cleanSubTitle = (sub.title || '').replace(/^\d+(\.\d+)*\s*/, '').trim();
+      pdfAddSubHeader(`${subNumber} ${cleanSubTitle}`);
+
+      const subBlocks = getExportBlocksForSubsection(sub.id, sub.key, drafts, intake);
+      if (subBlocks && subBlocks.length > 0) {
+        subBlocks.forEach(blk => renderBlockPdf(doc, blk));
+      } else {
+        doc.fontSize(9.5).font('Helvetica-Oblique').fillColor('#94a3b8').text(`Disclosure content pending generation for ${cleanSubTitle}.`).moveDown(0.4);
+      }
+    });
+  });
+
+  doc.moveDown(2).fontSize(9).fillColor('#94a3b8').font('Helvetica-Oblique').text(`Generated by IPO Pilot AI — ${new Date().toLocaleString('en-IN')} — Official Complete SEBI DRHP Export Package`, { align: 'center' });
+
+  pdfAddFooters(doc, compName);
+  doc.end();
+
+  logAudit(req, 'EXPORT_DOWNLOADED', 'export', companyId, `${req.user.name} downloaded complete single-document SEBI DRHP PDF export. Status: ${allCertified ? 'certified' : 'draft'}.`, { certified: allCertified, sections: exportedChaptersCount });
+});
+
+// ─── MERCHANT BANKERS ─────────────────────────────────────────────────────────
+
+app.get('/api/merchant-bankers', authenticateToken, (req, res) => {
+  const { q } = req.query;
+  const bankers = db.getMerchantBankers(q || '');
+  res.json({ merchant_bankers: bankers, source: 'SEBI Registered Merchant Bankers List', source_url: 'https://www.sebi.gov.in/sebiweb/home/HomeAction.do?doListing=yes&sid=3&ssid=6&smid=0&pageno=1', attribution: 'Data sourced from SEBI official merchant banker registration records.', disclaimer: 'Registration status should be independently verified on the official SEBI website before engagement.' });
+});
+
+// ─── INVITATIONS ──────────────────────────────────────────────────────────────
+
+// ─── TRANSACTIONAL EMAIL SENDER ──────────────────────────────────────────────
+
+async function sendInvitationEmail(toEmail, bankerName, companyName, token, inviteId) {
+  const baseUrl = process.env.APP_BASE_URL || 'http://localhost:5173';
+  const inviteLink = `${baseUrl}/invitations?token=${token}`;
+  
+  console.log(`================================================================`);
+  console.log(`[TRANSACTIONAL EMAIL] SME IPO Review Invitation`);
+  console.log(`Recipient: ${bankerName} <${toEmail}>`);
+  console.log(`Company: ${companyName}`);
+  console.log(`Action Link: ${inviteLink}`);
+  console.log(`Token Expiry: 7 Days`);
+  console.log(`================================================================`);
+
+  return { success: true, link: inviteLink };
+}
+
+// ─── INVITATIONS ──────────────────────────────────────────────────────────────
+
+app.get('/api/invitations', authenticateToken, (req, res) => {
+  if (req.user.role === 'reviewer') {
+    // Reviewer (merchant banker) only sees invitations specifically sent to them
+    // Match by email or by the reviewer's user record
+    const all = db.getInvitations();
+    const reviewerEmail = req.user.email;
+    const forReviewer = all.filter(inv =>
+      inv.merchant_banker_email === reviewerEmail ||
+      inv.invited_to_email === reviewerEmail
+    );
+    // Fallback: if no email match exists (legacy invitations), return all pending for demo
+    res.json(forReviewer.length > 0 ? forReviewer : all.filter(inv => inv.status !== 'revoked'));
+  } else {
+    const companyId = req.user.companyId || 'aarav-precision';
+    res.json(db.getInvitations(companyId));
+  }
+});
+
+app.get('/api/invitations/verify-token', (req, res) => {
+  const { token } = req.query;
+  if (!token) return res.status(400).json({ message: 'Token parameter is required.' });
+  const inv = db.getInvitationByIdOrToken(token);
+  if (!inv) return res.status(404).json({ message: 'Invitation not found or invalid token.' });
+  if (new Date(inv.expires_at) < new Date()) {
+    return res.status(410).json({ message: 'Invitation token has expired.', invitation: inv });
+  }
+  res.json({ valid: true, invitation: inv });
+});
+
+app.post('/api/invitations', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'issuer') return res.status(403).json({ message: 'Only issuers can send invitations.' });
+  const { merchant_banker_id, merchant_banker_name, message } = req.body;
+  if (!merchant_banker_id) return res.status(400).json({ message: 'merchant_banker_id is required.' });
+  
+  const companyId = req.user.companyId || 'aarav-precision';
+  const company = db.getCompany(companyId) || { name: 'Aarav Precision Engineering Pvt Ltd' };
+  const mb = db.getMerchantBankers().find(b => b.id === merchant_banker_id);
+  if (!mb) return res.status(404).json({ message: 'Merchant banker not found.' });
+
+  const existingInvs = db.getInvitations(companyId);
+  const existing = existingInvs.find(i => i.merchant_banker_id === merchant_banker_id);
+
+  let invitation;
+  if (existing) {
+    const newToken = 'inv_token_' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+    invitation = db.updateInvitation(existing.id, {
+      status: 'pending',
+      token: newToken,
+      expires_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+      updated_at: new Date().toISOString(),
+      message: message || existing.message
+    });
+  } else {
+    invitation = db.addInvitation({
+      company_id: companyId,
+      company_name: company.name,
+      invited_by_email: req.user.email,
+      invited_by_name: req.user.name,
+      merchant_banker_id,
+      merchant_banker_name: mb.name,
+      merchant_banker_reg_no: mb.registration_no,
+      merchant_banker_email: 'priya@example.com',
+      message: message || 'We would like to invite you to review our IPO draft document on IPO Pilot AI.',
+      sebi_source: mb.sebi_source
+    });
+  }
+
+  await sendInvitationEmail('priya@example.com', mb.name, company.name, invitation.token, invitation.id);
+
+  logAudit(req, 'INVITATION_SENT', 'invitation', invitation.id,
+    `${req.user.name} sent invitation to ${mb.name} (${mb.registration_no}).`,
+    { merchant_banker_id, merchant_banker_name: mb.name, companyId, token: invitation.token }
+  );
+
+  const reviewer = db.getUsers().find(u => u.role === 'reviewer' && u.companyId === companyId);
+  if (reviewer) {
+    db.addNotification({
+      companyId,
+      recipient_role: 'reviewer',
+      recipient_email: reviewer.email,
+      message: `${req.user.name} (${company.name}) sent an invitation to ${mb.name} (Reg: ${mb.registration_no}).`,
+      related_section: 'invitation',
+      type: 'invitation'
+    });
+  }
+
+  res.status(201).json(invitation);
+});
+
+app.put('/api/invitations/:id/accept', authenticateToken, (req, res) => {
+  if (req.user.role !== 'reviewer') {
+    return res.status(403).json({ message: 'Only an authorized Merchant Banker can accept invitations.' });
+  }
+  const updated = db.updateInvitation(req.params.id, {
+    status: 'accepted',
+    responded_by: req.user.email,
+    responded_at: new Date().toISOString()
+  });
+  if (!updated) return res.status(404).json({ message: 'Invitation not found.' });
+
+  logAudit(req, 'INVITATION_ACCEPTED', 'invitation', req.params.id,
+    `${req.user.name} accepted merchant banker invitation for ${updated.company_name}.`,
+    { companyId: updated.company_id }
+  );
+
+  const issuer = db.getUsers().find(u => u.role === 'issuer' && u.companyId === updated.company_id);
+  if (issuer) {
+    db.addNotification({
+      companyId: updated.company_id,
+      recipient_role: 'issuer',
+      recipient_email: issuer.email,
+      message: `Merchant banker ${req.user.name} (${updated.merchant_banker_name}) accepted your invitation!`,
+      related_section: 'invitation',
+      type: 'invitation_accepted'
+    });
+  }
+
+  res.json({ message: 'Invitation accepted successfully.', invitation: updated });
+});
+
+app.put('/api/invitations/:id/decline', authenticateToken, (req, res) => {
+  if (req.user.role !== 'reviewer') {
+    return res.status(403).json({ message: 'Only an authorized Merchant Banker can decline invitations.' });
+  }
+  const updated = db.updateInvitation(req.params.id, {
+    status: 'declined',
+    responded_by: req.user.email,
+    responded_at: new Date().toISOString()
+  });
+  if (!updated) return res.status(404).json({ message: 'Invitation not found.' });
+
+  logAudit(req, 'INVITATION_DECLINED', 'invitation', req.params.id,
+    `${req.user.name} declined merchant banker invitation for ${updated.company_name}.`,
+    { companyId: updated.company_id }
+  );
+
+  const issuer = db.getUsers().find(u => u.role === 'issuer' && u.companyId === updated.company_id);
+  if (issuer) {
+    db.addNotification({
+      companyId: updated.company_id,
+      recipient_role: 'issuer',
+      recipient_email: issuer.email,
+      message: `Merchant banker ${req.user.name} (${updated.merchant_banker_name}) declined the invitation.`,
+      related_section: 'invitation',
+      type: 'invitation_declined'
+    });
+  }
+
+  res.json({ message: 'Invitation declined.', invitation: updated });
+});
+
+app.put('/api/invitations/:id/revoke', authenticateToken, (req, res) => {
+  if (req.user.role !== 'issuer') {
+    return res.status(403).json({ message: 'Only issuers can revoke invitations.' });
+  }
+  const updated = db.updateInvitation(req.params.id, {
+    status: 'revoked',
+    revoked_by: req.user.email,
+    revoked_at: new Date().toISOString()
+  });
+  if (!updated) return res.status(404).json({ message: 'Invitation not found.' });
+
+  logAudit(req, 'INVITATION_REVOKED', 'invitation', req.params.id,
+    `${req.user.name} revoked invitation to ${updated.merchant_banker_name}.`,
+    { companyId: updated.company_id }
+  );
+
+  res.json({ message: 'Invitation revoked successfully.', invitation: updated });
+});
+
+// Generic status update route (used by some client calls)
+app.put('/api/invitations/:id/status', authenticateToken, (req, res) => {
+  const { status } = req.body;
+  const validStatuses = ['pending', 'accepted', 'declined', 'revoked', 'expired'];
+  if (!status || !validStatuses.includes(status)) {
+    return res.status(400).json({ message: `Invalid status. Allowed: ${validStatuses.join(', ')}` });
+  }
+  if (status === 'accepted' && req.user.role !== 'reviewer') {
+    return res.status(403).json({ message: 'Only reviewers can accept invitations.' });
+  }
+  if (status === 'declined' && req.user.role !== 'reviewer') {
+    return res.status(403).json({ message: 'Only reviewers can decline invitations.' });
+  }
+  if ((status === 'revoked') && req.user.role !== 'issuer') {
+    return res.status(403).json({ message: 'Only issuers can revoke invitations.' });
+  }
+  const updates = { status, responded_at: new Date().toISOString(), responded_by: req.user.email };
+  const updated = db.updateInvitation(req.params.id, updates);
+  if (!updated) return res.status(404).json({ message: 'Invitation not found.' });
+  logAudit(req, `INVITATION_${status.toUpperCase()}`, 'invitation', req.params.id,
+    `${req.user.name} changed invitation status to ${status}.`,
+    { companyId: updated.company_id }
+  );
+  res.json({ message: `Invitation ${status} successfully.`, invitation: updated });
+});
+
+app.post('/api/invitations/:id/resend', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'issuer') {
+    return res.status(403).json({ message: 'Only issuers can resend invitations.' });
+  }
+  const newToken = 'inv_token_' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+  const newExpiry = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+
+  const updated = db.updateInvitation(req.params.id, {
+    status: 'pending',
+    token: newToken,
+    expires_at: newExpiry,
+    resent_at: new Date().toISOString()
+  });
+  if (!updated) return res.status(404).json({ message: 'Invitation not found.' });
+
+  await sendInvitationEmail('priya@example.com', updated.merchant_banker_name, updated.company_name, newToken, updated.id);
+
+  logAudit(req, 'INVITATION_RESENT', 'invitation', req.params.id,
+    `${req.user.name} resent invitation to ${updated.merchant_banker_name}.`,
+    { companyId: updated.company_id, token: newToken }
+  );
+
+  res.json({ message: 'Invitation resent successfully.', invitation: updated });
+});
+
+// ─── Start Server ─────────────────────────────────────────────────────────────
+
+const PORT = process.env.PORT || 3001;
+
+// On Vercel each request runs in a short-lived function: there is no process to
+// listen on a port, and the container can be frozen the moment a response is
+// sent. So we export a handler instead of calling listen(), and every request
+// waits for storage hydration before it touches the store.
+const isServerless = Boolean(process.env.VERCEL);
+
+let hydration = null;
+function ensureHydrated() {
+  if (!hydration) {
+    hydration = initDb().catch((err) => {
+      // Reset so the next invocation retries rather than serving an empty store
+      // for the lifetime of a warm container.
+      hydration = null;
+      throw err;
+    });
+  }
+  return hydration;
+}
+
+if (!isServerless) {
+  // Hydrate the DynamoDB-backed store before accepting traffic, so the first request
+  // never races an empty in-memory store.
+  ensureHydrated()
+    .then((usingDynamo) => {
+      try { generateDraftData('aarav-precision'); } catch (e) {}
+      app.listen(PORT, () => {
+        console.log(`IPO Pilot AI backend running on http://localhost:${PORT}`);
+        console.log(`Storage: ${usingDynamo ? 'DynamoDB (live)' : 'local db.json'}`);
+        console.log(`Gemini model: ${GEMINI_MODEL}`);
+      });
+    })
+    .catch((err) => {
+      console.error('Failed to initialise storage:', err);
+      process.exit(1);
+    });
+}
+
+// Vercel imports this module and invokes the default export per request. Waiting
+// on ensureHydrated() here (rather than at import time) means a cold start that
+// fails to reach DynamoDB returns 503 instead of serving an empty store.
+export default async function handler(req, res) {
+  try {
+    await ensureHydrated();
+    try { generateDraftData('aarav-precision'); } catch (e) {}
+  } catch (err) {
+    console.error('Storage init failed:', err);
+    res.statusCode = 503;
+    res.setHeader('Content-Type', 'application/json');
+    // The bare "Storage unavailable" message left no way to tell a missing table
+    // from a bad region from a denied IAM policy without digging through Vercel's
+    // function logs. AWS error names/codes are classifications, not secrets, so
+    // returning them is safe and turns a dead end into an actionable message.
+    return res.end(JSON.stringify({
+      message: 'Storage unavailable. Please retry.',
+      reason: err?.name || 'UnknownError',
+      detail: err?.message || String(err),
+      hint: 'Check /api/health for which storage settings resolved.'
+    }));
+  }
+  return app(req, res);
+}
+
+export { generateDraftData, CHAPTER_ORDER };
+

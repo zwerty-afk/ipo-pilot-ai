@@ -1,0 +1,146 @@
+import { createContext, useContext, useState, useEffect, useCallback } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { login as loginApi, register as registerApi, getMe } from '../services/api';
+
+const AuthContext = createContext(null);
+
+export function AuthProvider({ children }) {
+  const [user, setUser] = useState(null);
+  const [token, setToken] = useState(localStorage.getItem('ipo_token'));
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    const checkAuth = async () => {
+      let storedToken = localStorage.getItem('ipo_token');
+      if (storedToken) {
+        try {
+          const res = await getMe();
+          const userData = res.data.user || res.data;
+          setUser(userData);
+          if (userData?.companyId) {
+            localStorage.setItem('ipo_company_id', userData.companyId);
+          }
+          setToken(storedToken);
+          setLoading(false);
+          return;
+        } catch (err) {
+          console.warn('Existing session invalid, clearing token:', err);
+          localStorage.removeItem('ipo_token');
+        }
+      }
+
+      // If on login page or unauthenticated, do not force auto-demo login if on /login
+      const isLoginPage = typeof window !== 'undefined' && window.location.pathname === '/login';
+      if (!isLoginPage) {
+        try {
+          const res = await loginApi('priya@example.com', 'demo123');
+          const { token: newToken, user: userData } = res.data;
+          localStorage.setItem('ipo_token', newToken);
+          if (userData?.companyId && !localStorage.getItem('ipo_company_id')) {
+            localStorage.setItem('ipo_company_id', userData.companyId);
+          }
+          setToken(newToken);
+          setUser(userData);
+        } catch (err) {
+          console.error('Demo auto-authentication error:', err);
+          setUser(null);
+          setToken(null);
+        } finally {
+          setLoading(false);
+        }
+      } else {
+        setUser(null);
+        setToken(null);
+        setLoading(false);
+      }
+    };
+    checkAuth();
+  }, []);
+
+  const login = useCallback(async (email, password) => {
+    const res = await loginApi(email, password);
+    const { token: newToken, user: userData } = res.data;
+    localStorage.setItem('ipo_token', newToken);
+    if (userData?.companyId) {
+      localStorage.setItem('ipo_company_id', userData.companyId);
+    }
+    window.dispatchEvent(new CustomEvent('ipo-company-changed'));
+    setToken(newToken);
+    setUser(userData);
+    return res.data;
+  }, []);
+
+  const register = useCallback(async (payload) => {
+    const res = await registerApi(payload);
+    const { token: newToken, user: userData } = res.data;
+    localStorage.setItem('ipo_token', newToken);
+    if (userData?.companyId) {
+      localStorage.setItem('ipo_company_id', userData.companyId);
+    }
+    window.dispatchEvent(new CustomEvent('ipo-company-changed'));
+    setToken(newToken);
+    setUser(userData);
+    return res.data;
+  }, []);
+
+  const logout = useCallback(() => {
+    localStorage.removeItem('ipo_token');
+    localStorage.removeItem('ipo_company_id');
+    window.dispatchEvent(new CustomEvent('ipo-company-changed'));
+    setToken(null);
+    setUser(null);
+  }, []);
+
+  const isAuthenticated = !!user && !!token;
+
+  return (
+    <AuthContext.Provider value={{ user, token, loading, login, register, logout, isAuthenticated }}>
+      {children}
+    </AuthContext.Provider>
+  );
+}
+
+export function useAuth() {
+  const ctx = useContext(AuthContext);
+  if (!ctx) throw new Error('useAuth must be used within AuthProvider');
+  return ctx;
+}
+
+export function ProtectedRoute({ children, requiredRole }) {
+  const { isAuthenticated, loading, user } = useAuth();
+  const navigate = useNavigate();
+
+  useEffect(() => {
+    if (!loading && !isAuthenticated) {
+      navigate('/login', { replace: true });
+    }
+  }, [loading, isAuthenticated, navigate]);
+
+  if (loading) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-slate-50">
+        <div className="animate-spin rounded-full h-10 w-10 border-b-2 border-indigo-600"></div>
+      </div>
+    );
+  }
+
+  if (!isAuthenticated) return null;
+
+  if (requiredRole && user?.role !== requiredRole) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-slate-50">
+        <div className="glass-card p-8 text-center max-w-md">
+          <div className="w-16 h-16 bg-red-100 rounded-full flex items-center justify-center mx-auto mb-4">
+            <span className="text-red-600 text-2xl">⚠</span>
+          </div>
+          <h2 className="text-xl font-semibold text-slate-800 mb-2">Access Denied</h2>
+          <p className="text-slate-500">You don't have permission to access this page.</p>
+        </div>
+      </div>
+    );
+  }
+
+  return children;
+}
+
+export default AuthContext;
