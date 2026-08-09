@@ -18,3 +18,5 @@ server/db.json
 server/mkpdf.mjs
 server/test-incorp.pdf
 server/test_*.js
+.vercel
+.env*

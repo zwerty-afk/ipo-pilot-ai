@@ -68,7 +68,7 @@ async function loadAll() {
   const out = {};
   let ExclusiveStartKey;
   do {
-    const res = await doc.send(new ScanCommand({ TableName: TABLE, ExclusiveStartKey }));
+    const res = await doc.send(new ScanCommand({ TableName: TABLE, ExclusiveStartKey, ConsistentRead: true }));
     (res.Items || []).forEach((item) => {
       const { pk, value } = item;
       if (pk) out[pk] = value;
