@@ -1909,10 +1909,20 @@ async function runDocumentOcr({ docId, source, docType, companyId }) {
     console.warn(`[OCR] extraction failed for doc ${docId}: ${ocrErr?.message || ocrErr}`);
   }
 
-  // No fabricated fallback. If the OCR engine could not read the document we
-  // must say so: inventing plausible financials for a SEBI filing would let
-  // unverified numbers flow into the DRHP looking like extracted evidence.
+  // "Did OCR actually read the document" and "did the model map every field we
+  // asked for" are different questions. A scanned document in an unusual layout
+  // can come back with full, readable ocr_text but zero matches against a rigid
+  // field list (e.g. a balance-sheet-first financial statement when the prompt
+  // expects a P&L-first one) — that document was still successfully scanned and
+  // must not be reported as a failure asking the user to "retry", which cannot
+  // help since nothing was actually broken.
+  //
+  // No fabricated fallback either way: if the model could not be reached or its
+  // response could not be parsed at all (ocrFailure set, no text), we must say
+  // so rather than inventing plausible financials for a SEBI filing.
+  const gotText = typeof extractedText === 'string' && extractedText.trim().length > 0;
   const gotValues = Object.keys(extractedValues).length > 0;
+  const ocrSucceeded = !ocrFailure && gotText;
 
   try {
     const data = getDb();
@@ -1922,15 +1932,15 @@ async function runDocumentOcr({ docId, source, docType, companyId }) {
       return { gotValues: false, extractedValues: {}, error: ocrFailure };
     }
 
-    doc.ocr_status = gotValues ? 'completed' : 'failed';
+    doc.ocr_status = ocrSucceeded ? 'completed' : 'failed';
     doc.ocr_text = extractedText;
-    doc.extracted_values = gotValues ? extractedValues : {};
-    doc.ocr_error = gotValues
-      ? null
+    doc.extracted_values = ocrSucceeded ? extractedValues : {};
+    doc.ocr_error = ocrSucceeded
+      ? (gotValues ? null : 'Document was read, but none of the expected fields could be matched. Review the extracted text and enter values manually.')
       : (ocrFailure || 'The document could not be read automatically. Please enter these values manually.');
     saveDb(data);
 
-    if (gotValues) {
+    if (ocrSucceeded) {
       generateDraftData(companyId);
       console.log(`[OCR] completed for document ${docId} (${docType}) — ${Object.keys(extractedValues).length} fields`);
     } else {
@@ -1941,17 +1951,19 @@ async function runDocumentOcr({ docId, source, docType, companyId }) {
       companyId,
       recipient_role: 'issuer',
       recipient_email: doc.uploaded_by || 'aarav@example.com',
-      message: gotValues
-        ? `OCR completed for document: "${doc.name}". Extracted ${Object.keys(extractedValues).length} key fields.`
+      message: ocrSucceeded
+        ? (gotValues
+          ? `OCR completed for document: "${doc.name}". Extracted ${Object.keys(extractedValues).length} key fields.`
+          : `Document scanned: "${doc.name}". No matching fields found — review the extracted text and enter values manually.`)
         : `Could not auto-read "${doc.name}". Please retry extraction or enter its values manually.`,
       related_section: 'documents',
-      type: gotValues ? 'ocr_completed' : 'ocr_failed'
+      type: ocrSucceeded ? 'ocr_completed' : 'ocr_failed'
     });
   } catch (dbErr) {
     console.error('[OCR] DB save error:', dbErr.message);
   }
 
-  return { gotValues, extractedValues, error: ocrFailure };
+  return { gotValues: ocrSucceeded, extractedValues, error: ocrFailure };
 }
 
 app.get('/api/documents/:companyId', authenticateToken, (req, res) => {
