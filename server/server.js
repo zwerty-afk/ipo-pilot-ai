@@ -1989,6 +1989,30 @@ app.post('/api/documents/:companyId/upload', authenticateToken, (req, res) => {
       d => d.name === req.file.originalname && d.doc_type === doc_type
     );
 
+    // Each intake slot maps to exactly one doc_type and the UI shows a single
+    // "existing document" per slot, so a second upload to the same slot is a
+    // replacement, not an addition. Without this, the old document stayed in
+    // the DB forever, the new one was uploaded successfully but the slot kept
+    // showing the old (first-in-array) document — the new upload appeared to
+    // silently vanish.
+    const superseded = existingDocs.filter(d => d.doc_type === doc_type);
+    for (const old of superseded) {
+      db.deleteDocument(old.id);
+      if ((old.s3_key || old.storage_type === 's3') && hasAwsCredentials && S3_BUCKET) {
+        try {
+          await s3.send(new DeleteObjectCommand({ Bucket: S3_BUCKET, Key: old.s3_key || `documents/${old.name}` }));
+        } catch (s3Err) {
+          console.warn(`[UPLOAD] replaced-doc S3 cleanup warning (${old.s3_key}):`, s3Err.message);
+        }
+      } else if (old.file_path) {
+        try {
+          if (fs.existsSync(old.file_path)) fs.unlinkSync(old.file_path);
+        } catch (fileErr) {
+          console.warn(`[UPLOAD] replaced-doc local file cleanup warning (${old.file_path}):`, fileErr.message);
+        }
+      }
+    }
+
     const newDoc = {
       id: `doc-${Date.now()}`,
       companyId,
@@ -2041,6 +2065,18 @@ app.post('/api/documents/:companyId/upload', authenticateToken, (req, res) => {
       // uploaded document stuck on "processing" forever in production. Run OCR
       // before responding instead. Slower to return, but it actually finishes,
       // and the flush middleware then persists the results with the response.
+      //
+      // waitUntil() from @vercel/functions looks like the right tool (keep the
+      // invocation alive after responding), but it depends on a request-context
+      // object Vercel injects around its own function wrappers. This project
+      // exports a bare Express app (api/index.js re-exports server.js directly),
+      // which does not reliably receive that context: waitUntil()'s promise is
+      // registered against an empty context and never actually awaited, so the
+      // container can freeze mid-OCR with the write silently lost — confirmed by
+      // a real upload whose OCR completed in the logs but never reached
+      // DynamoDB. Blocking is slower but correct; do not swap this back to
+      // waitUntil without first confirming Vercel's request-context is present
+      // for this handler shape.
       await runDocumentOcr({ docId: newDoc.id, source, docType: doc_type, companyId });
       const finished = db.getDocuments(companyId).find(d => d.id === newDoc.id) || newDoc;
       return res.json({ ...finished, message: uploadMessage });
