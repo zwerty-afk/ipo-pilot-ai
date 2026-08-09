@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import { useSearchParams, useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import {
   getIntakeStep,
@@ -696,6 +696,7 @@ function DocumentUploadSlot({ slot, companyId, documents, setDocuments, onUpload
 
 export default function IntakeForm() {
   const { user } = useAuth();
+  const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const targetStep = searchParams.get('step');
   const targetField = searchParams.get('field');
