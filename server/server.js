@@ -13,7 +13,7 @@ import { Document, Packer, Paragraph, TextRun, HeadingLevel, AlignmentType, Tabl
 import PDFDocument from 'pdfkit';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import cron from 'node-cron';
-import { db, getDb, saveDb, hashPassword, verifyPassword, initDb, flushDb } from './db.js';
+import { db, getDb, saveDb, hashPassword, verifyPassword, initDb, flushDb, refreshDb } from './db.js';
 import {
   DRHP_HIERARCHY, getExportBlocksForSubsection, renderBlockDocx, renderBlockPdf,
   resolveFrontMatterContext, renderFrontMatterDocx, renderFrontMatterPdf,
@@ -3403,6 +3403,15 @@ if (!isServerless) {
 export default async function handler(req, res) {
   try {
     await ensureHydrated();
+    // ensureHydrated() only does its real work (the DynamoDB Scan) once per
+    // container — every request after the first on a warm container used to
+    // skip straight past it and serve that container's original snapshot, no
+    // matter how much other containers had written since. A document uploaded
+    // via one container could be invisible to every other already-warm
+    // container for as long as they stayed warm — which on Vercel can be
+    // minutes. refreshDb() re-syncs from DynamoDB on every request so any
+    // container reflects what every other container has written.
+    await refreshDb();
     try { generateDraftData('aarav-precision'); } catch (e) {}
   } catch (err) {
     console.error('Storage init failed:', err);

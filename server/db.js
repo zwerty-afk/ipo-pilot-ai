@@ -8,7 +8,8 @@ import {
   isReady,
   readStore,
   writeStore,
-  flushStore as flushDynamoStore
+  flushStore as flushDynamoStore,
+  refreshStore
 } from './dynamoStore.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -764,6 +765,16 @@ export async function initDb() {
 export async function flushDb() {
   if (!dynamoEnabled || !isReady()) return;
   await flushDynamoStore();
+}
+
+/**
+ * Re-syncs the in-memory store from DynamoDB. Call before serving a request
+ * on serverless — see refreshStore() in dynamoStore.js for why a warm
+ * container cannot be trusted to already have what other containers wrote.
+ */
+export async function refreshDb() {
+  if (!dynamoEnabled || !isReady()) return;
+  await refreshStore();
 }
 
 export const db = {

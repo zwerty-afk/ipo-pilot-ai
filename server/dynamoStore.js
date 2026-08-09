@@ -135,6 +135,51 @@ export function isReady() {
   return ready && store !== null;
 }
 
+// Bounds how stale a warm container's view of DynamoDB can get. A full Scan
+// on every single request (the fully-correct option) added ~2.5-3s to every
+// request, which trades the "stale until logout" bug for an "always slow"
+// one. Refreshing at most this often per container keeps most requests on
+// the in-memory snapshot while still self-correcting quickly — a write made
+// on another container becomes visible here within one window, not only
+// when this container happens to be recycled.
+const REFRESH_INTERVAL_MS = Number(process.env.DYNAMO_REFRESH_INTERVAL_MS || 5000);
+let lastRefreshAt = 0;
+
+/**
+ * Re-syncs the in-memory store from DynamoDB. Vercel keeps a container warm
+ * across many requests, but initStore() only ever runs once per container —
+ * every request after the first kept serving that container's original
+ * snapshot forever, with no way to see writes made by any other container.
+ * A promoter's upload could land in DynamoDB via one container while every
+ * other already-warm container kept answering "not there" indefinitely, only
+ * self-correcting when that container happened to recycle — which is what
+ * made logging out and back in "fix" it: enough time passed for a fresh
+ * container to be assigned.
+ *
+ * Called before every serverless request, but throttled to REFRESH_INTERVAL_MS
+ * so most requests reuse the recent snapshot instead of paying for a Scan.
+ */
+export async function refreshStore() {
+  if (!dynamoEnabled || !ready) return;
+  if (Date.now() - lastRefreshAt < REFRESH_INTERVAL_MS) return;
+  lastRefreshAt = Date.now();
+  const loaded = await loadAll();
+  // Merge rather than replace, and skip any key with a write still pending or
+  // in flight on this container (dirty, or not yet reflected in `persisted`).
+  // Node is single-threaded but this function awaits a Scan, so a concurrent
+  // request on the same warm container can run a full read-modify-write
+  // (getDb -> mutate -> saveDb) while this call is in flight. Overwriting that
+  // key unconditionally on resume would silently discard a write that had
+  // already been committed to DynamoDB, and reset `persisted` out from under
+  // it, corrupting future dirty-detection for that key.
+  Object.keys(loaded).forEach((key) => {
+    if (dirty.has(key)) return;
+    if (persisted[key] !== undefined && persisted[key] !== JSON.stringify(store[key])) return;
+    store[key] = loaded[key];
+    persisted[key] = JSON.stringify(loaded[key]);
+  });
+}
+
 /** Synchronous read of the in-memory store. */
 export function readStore() {
   return store;
