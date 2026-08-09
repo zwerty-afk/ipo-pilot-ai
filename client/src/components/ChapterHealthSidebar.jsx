@@ -13,7 +13,8 @@ import {
   X,
   ArrowRight,
   Clock,
-  User
+  User,
+  Eye
 } from 'lucide-react';
 import { DRHP_HIERARCHY } from '../data/sebiDrhpSchema';
 
