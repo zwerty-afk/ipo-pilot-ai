@@ -1,6 +1,6 @@
 # IPO Pilot AI
 
-> AI-assisted DRHP (Draft Red Herring Prospectus) drafting workspace for SME IPOs — built for the merchant banker and promoter to collaborate in one place, from raw documents to a filing-ready draft.
+> An AI-assisted workspace for drafting SEBI-compliant DRHPs (Draft Red Herring Prospectuses) for SME IPOs — built so the promoter and the merchant banker work from the same live document, the same readiness score, and the same evidence trail.
 
 ![Status](https://img.shields.io/badge/Status-Live-brightgreen)
 ![React](https://img.shields.io/badge/Frontend-React%20%2B%20Vite-61DAFB)
@@ -12,43 +12,119 @@
 
 ---
 
-## Problem
+## The problem
 
-Preparing an SME IPO offer document is slow, manual, and expensive. Promoters lean on merchant bankers, legal counsel, and compliance professionals to turn scattered incorporation papers, financials, and cap tables into a SEBI-compliant DRHP — with every cross-reference, disclosure, and figure checked by hand.
+Taking an SME through an IPO means turning incorporation papers, audited financials, a cap table, and a promoter's answers into a Draft Red Herring Prospectus that satisfies SEBI ICDR and the Companies Act — with every figure, disclosure, and cross-reference checked by hand before a merchant banker will sign off on it. That process is slow, expensive, and repeats the same manual checks on every filing.
 
-IPO Pilot AI shortens that cycle without removing the humans who are legally responsible for the filing: the platform drafts, checks, and flags; the merchant banker reviews and certifies.
+IPO Pilot AI compresses the mechanical parts of that work — extraction, drafting, consistency checking, compliance validation — without removing the humans who are legally accountable for the filing. The platform drafts, checks, and flags; the merchant banker reviews and certifies.
 
 ---
 
-## What it does
+## How it works
 
-1. **Promoter uploads source documents** — incorporation certificates, MOA/AOA, audited financials, cap table, litigation records, factory images, and more.
-2. **Gemini-powered OCR extracts structured data** from each document (financial figures, shareholding percentages, litigation references, entity details) and suggests prefills for the intake questionnaire.
-3. **An adaptive intake questionnaire** collects everything the OCR couldn't — adjusting its required fields to the company's industry profile (manufacturing, software, pharma, F&B, etc.).
-4. **Cross-document consistency checks** catch the exact mismatches a reviewer would otherwise find manually — e.g. "promoter intake states 12.5 Cr revenue, but the audited financials document says 11.8 Cr."
-5. **A compliance checklist** validates the intake against SEBI ICDR / Companies Act requirements.
-6. **The DRHP is generated chapter-by-chapter** into the real SEBI hierarchy (General Information, Business Overview, Financials, Capital Structure, Risk Factors, Litigation, and more), with every generated fact traceable back to its source document or intake field.
-7. **The reviewer (merchant banker) certifies each chapter** — comments, requests changes, approves, and signs off — before anything is considered final.
-8. **A single IPO Readiness Score (0–100)** rolls all of the above into one number: intake completeness, compliance checks passed, gaps resolved, and chapters certified — so both sides always know exactly what's left.
-9. **The finished draft exports to DOCX/PDF**, rendered with real tables, charts, and org diagrams matching the on-screen draft.
+**1. Upload source documents.** The promoter uploads incorporation certificates, MOA/AOA, PAN and GST certificates, audited financials, the cap table, litigation records, factory photographs, and more — organized by SEBI-mandated section.
+
+<p align="center">
+  <img src="screenshots/Screenshot (39).png" width="100%">
+  <br><sub>Company Details — section-scoped document upload with OCR processing</sub>
+</p>
+
+**2. Gemini OCR reads every document.** Each upload is parsed for the structured fields that section needs — CIN, incorporation date, revenue figures, promoter shareholding, litigation references — and offered back as prefill suggestions for the intake questionnaire.
+
+**3. An adaptive intake questionnaire** collects everything OCR couldn't, adjusting its required fields to the company's industry profile (precision manufacturing, software, pharma, F&B, and others each ask different questions).
+
+<p align="center">
+  <img src="screenshots/Screenshot (36).png" width="100%">
+  <br><sub>Intake Form — Risk Information step, with the AI Copilot surfacing a live data mismatch</sub>
+</p>
+
+**4. Cross-document consistency checks (Gap Analysis)** catch exactly the kind of mismatch a reviewer would otherwise have to find by hand — a revenue figure in the intake form that doesn't match the audited financials, a promoter shareholding percentage that disagrees with the cap table.
+
+<p align="center">
+  <img src="screenshots/Screenshot (28).png" width="100%">
+  <br><sub>Gap Analysis — data consistency, completeness, and risk-disclosure checks with per-item point scoring</sub>
+</p>
+
+**5. A statutory compliance checklist** validates the filing against named SEBI ICDR and Companies Act provisions — each rule shows its pass/fail status, the evidence used, and the exact regulation it maps to.
+
+<p align="center">
+  <img src="screenshots/Screenshot (27).png" width="100%">
+  <br><sub>Statutory Compliance Checklist — rule-by-rule validation against SEBI ICDR 2018 and the Companies Act 2013</sub>
+</p>
+
+**6. The DRHP drafts itself, chapter by chapter,** into the real SEBI hierarchy — Risk Factors, Business Overview, Financial Information, Capital Structure, and the rest — with every generated statement grounded in a source document or intake answer, shown as a clickable evidence tag.
+
+<p align="center">
+  <img src="screenshots/Screenshot (30).png" width="100%">
+  <br><sub>Draft Prospectus — Risk Factors chapter, each risk grounded in an evidence-tagged source</sub>
+</p>
+
+**7. The merchant banker reviews and certifies** in a dedicated workspace — raising issues, leaving comments, and either approving, requesting changes, or certifying each chapter. Certification is the only action that counts toward readiness; approval alone does not.
+
+<p align="center">
+  <img src="screenshots/Screenshot (41).png" width="100%">
+  <br><sub>Reviewer Workspace — open issues, AI findings, and chapter-level certification controls</sub>
+</p>
+
+**8. Identity and document authenticity are verified** against GST, PAN, and MCA/CIN records, with every field compared side-by-side against the source document and a full verification history.
+
+<p align="center">
+  <img src="screenshots/Screenshot (38).png" width="100%">
+  <br><sub>Fraud & Verification — GST/PAN/MCA cross-checks with a field-level details comparison</sub>
+</p>
+
+**9. One IPO Readiness Score** rolls all of the above into a single 0–100 number, broken into the four real stages of the journey.
+
+<p align="center">
+  <img src="screenshots/Screenshot (29).png" width="100%">
+  <br><sub>IPO Readiness — the four-stage cumulative scoring model, with exactly what remains to earn each point</sub>
+</p>
+
+**10. The finished draft exports to DOCX or PDF**, rendered to look like the real filing document — cover page, statutory disclosures, tables, and all — not just a text dump of the on-screen draft.
+
+<p align="center">
+  <img src="screenshots/Screenshot (42).png" width="100%">
+  <br><sub>DRHP Export — the generated Draft Red Herring Prospectus cover page, ready as DOCX or PDF</sub>
+</p>
+
+Everything above is tied together by a command-center dashboard that surfaces the day's priorities, critical compliance issues, and draft progress in one view —
+
+<p align="center">
+  <img src="screenshots/Screenshot (25).png" width="100%">
+</p>
+
+— a live SEBI regulatory feed so filings stay current with the latest circulars —
+
+<p align="center">
+  <img src="screenshots/Screenshot (34).png" width="100%">
+  <br><sub>SEBI Regulatory Updates — fetched from the official SEBI circulars portal</sub>
+</p>
+
+— and an invitation flow that brings a SEBI-registered merchant banker onto a company's workspace to begin the review.
+
+<p align="center">
+  <img src="screenshots/Screenshot (35).png" width="100%">
+  <br><sub>Merchant Banker Invitations — search SEBI-registered bankers by name, registration number, or location</sub>
+</p>
 
 ---
 
 ## Features
 
-- Secure login with role-based access (issuer / promoter vs. reviewer / merchant banker)
-- Document upload with OCR extraction and duplicate detection
-- Adaptive intake questionnaire with industry-specific fields and a live completeness heatmap
-- AI-drafted DRHP content across the full SEBI chapter structure, with in-app source citations
-- Cross-document consistency checks (Gap Analysis) — flags mismatches between intake answers and uploaded documents
-- SEBI/Companies Act compliance checklist with automatic pass/fail evaluation
-- IPO Readiness Score — a single, additive 100-point score across intake, compliance, gap resolution, and reviewer certification
-- Reviewer Workspace — inline comments, chapter approval/rejection, and certification sign-off
-- Fraud & Verification tools for reviewers
-- Invitation flow to bring a merchant banker or promoter onto a company's workspace
-- Live SEBI circular feed, auto-refreshed on a schedule
-- Audit log of every meaningful action (uploads, deletions, certifications, status changes)
-- DOCX/PDF export that mirrors the in-app draft, including tables and vector-rendered charts
+- Secure, role-based login — separate issuer (promoter) and reviewer (merchant banker) workspaces
+- Section-scoped document upload with Gemini OCR extraction, duplicate detection, and retry-on-failure
+- Adaptive intake questionnaire — required fields change with the company's industry profile, with a live per-section completeness heatmap
+- AI-drafted DRHP content across the full SEBI chapter structure, every statement grounded to a clickable source
+- Gap Analysis — automated cross-document consistency checks across intake data, financials, and the cap table
+- Statutory Compliance Checklist — rule-by-rule SEBI ICDR / Companies Act validation with evidence and pass/fail status
+- IPO Readiness Score — one additive 0–100 score across intake, compliance, gap resolution, and reviewer certification
+- Reviewer Workspace — inline comments, issue tracking, chapter approval/rejection, and final certification
+- Fraud & Verification — GST, PAN, and MCA/CIN cross-checks with field-level comparison and audit history
+- An in-app AI Copilot grounded only in the active company's live workspace data, with citations back to the source page
+- Merchant banker invitation flow, searchable against SEBI-registered intermediaries
+- Live SEBI regulatory circular feed, auto-refreshed on a schedule
+- Full audit log of uploads, deletions, certifications, and status changes
+- DOCX/PDF export rendered to match a real filing document — tables, charts, and org structure included
 
 ---
 
@@ -60,15 +136,15 @@ IPO Pilot AI shortens that cycle without removing the humans who are legally res
 - React Router
 
 **Backend**
-- Node.js + Express (deployed as a single Vercel serverless function)
-- AWS DynamoDB — primary data store (users, companies, intake, documents, drafts, audit logs)
+- Node.js + Express, deployed as a Vercel serverless function
+- AWS DynamoDB — primary data store
 - AWS S3 — document and export file storage
-- Google Gemini — OCR extraction and AI drafting
+- Google Gemini — OCR extraction, AI drafting, and the workspace-grounded Copilot
 - `docx` + `pdfkit` + `sharp` — DRHP export rendering
 
 **Infrastructure**
-- Vercel — hosting, serverless functions, and a daily cron job for SEBI circular refresh
-- HMAC-signed session tokens (no third-party auth provider)
+- Vercel — hosting, serverless functions, and a scheduled cron job for SEBI circular refresh
+- HMAC-signed session tokens — no third-party auth provider
 
 ---
 
@@ -81,8 +157,8 @@ IPO_Pilot_AI/
 ├── client/                   # React + Vite frontend
 │   ├── src/
 │   │   ├── pages/            # Dashboard, Intake, Compliance, Gap Analysis, Readiness,
-│   │   │                     # Draft Preview, Reviewer Workspace, Export, SEBI Updates,
-│   │   │                     # Invitations, Fraud & Verification
+│   │   │                     # Draft Preview, Reviewer Workspace, Fraud & Verification,
+│   │   │                     # Export, SEBI Updates, Invitations
 │   │   ├── components/
 │   │   ├── context/           # Auth + shared draft/readiness state
 │   │   ├── services/api.js    # Single axios client for all backend calls
@@ -95,7 +171,7 @@ IPO_Pilot_AI/
 │   ├── dynamoStore.js         # DynamoDB-backed persistence with write coalescing
 │   ├── drhpExportEngine.js    # DOCX/PDF export rendering
 │   ├── verificationEngine.js  # Fraud & document verification checks
-│   ├── copilotRetrieval.js    # RAG-style retrieval for the in-app copilot
+│   ├── copilotRetrieval.js    # Grounded retrieval layer for the in-app AI Copilot
 │   └── package.json
 ├── vercel.json                 # Build, rewrites, and cron configuration
 ├── DEPLOYMENT.md               # Full Vercel deployment guide
@@ -159,9 +235,9 @@ The score is a single, additive 0–100 metric — nothing in it ever subtracts 
 | Stage | Points | What earns them |
 |---|---|---|
 | Intake & Company Information | 40 | Required fields filled across 11 sections, weighted by disclosure depth |
-| Compliance Checks | 20 | SEBI ICDR / Companies Act rules passed |
+| Compliance & SEBI Checks | 20 | SEBI ICDR / Companies Act rules passed |
 | Gap Analysis & Remediation | 20 | AI-flagged inconsistencies resolved |
-| Reviewer Certification | 20 | DRHP chapters certified by the reviewer |
+| Reviewer Certification | 20 | DRHP chapters certified by the reviewer — approval alone does not count |
 
 The same calculation (`client/src/utils/readinessEngine.js`) backs every score shown in the app — the sidebar meter, the Dashboard summary, and the dedicated Readiness page all read from one shared context, so the number is always consistent.
 
@@ -173,6 +249,7 @@ IPO Pilot AI is built around a human-in-the-loop model:
 
 - AI drafts content and flags issues — it never files anything
 - Every generated fact is traceable back to its source document or intake answer
+- The in-app Copilot answers only from the active company's live workspace data — never from general knowledge — and cites the page it pulled from
 - A qualified reviewer must certify each chapter before it counts toward readiness
 - No disclosure is ever auto-submitted to SEBI or any regulator
 
@@ -185,34 +262,6 @@ IPO Pilot AI is built around a human-in-the-loop model:
 - Main Board IPO support (currently SME-focused)
 - Expanded compliance rule coverage
 - Draft version comparison
-
----
-
-## Screenshots
-
-<p align="center">
-  <img src="screenshots/Screenshot%202026-07-06%20221647.png" width="100%">
-</p>
-
-<p align="center">
-  <img src="screenshots/Screenshot%202026-07-06%20215826.png" width="100%">
-</p>
-
-<p align="center">
-  <img src="screenshots/Screenshot%202026-07-06%20215855.png" width="100%">
-</p>
-
-<p align="center">
-  <img src="screenshots/Screenshot%202026-07-06%20215914.png" width="100%">
-</p>
-
-<p align="center">
-  <img src="screenshots/Screenshot%202026-07-06%20215939.png" width="100%">
-</p>
-
-<p align="center">
-  <img src="screenshots/Screenshot%202026-07-06%20215946.png" width="100%">
-</p>
 
 ---
 
