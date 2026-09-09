@@ -1,11 +1,8 @@
 import 'dotenv/config';
-import { S3Client, DeleteObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
 import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
 import crypto from 'crypto';
-
-import multerS3 from 'multer-s3';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
@@ -26,15 +23,10 @@ import {
 import {
   detectSources, retrieveSources, buildContextBlock, isGeneralKnowledgeQuestion
 } from './copilotRetrieval.js';
-// Read directly from the store module: db.js deliberately does not re-export
-// these, but /api/health needs to report whether DynamoDB is configured and live.
-import { dynamoEnabled, isReady as isDbReady } from './dynamoStore.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-// Serverless filesystems are read-only apart from /tmp, so the local uploads dir
-// moves there. Uploads go to S3 whenever AWS credentials exist; this path is only
-// the no-credentials fallback.
+// Serverless filesystems are read-only apart from /tmp, so point uploads there.
 const UPLOADS_DIR = process.env.VERCEL ? '/tmp/uploads' : path.join(__dirname, 'uploads');
 
 // mkdir at import time would throw EROFS on a read-only deployment and kill the
@@ -245,52 +237,13 @@ const ALLOWED_MIME_TYPES = [
   'application/octet-stream'
 ];
 
-// S3_BUCKET is the name documented in .env.example and DEPLOYMENT.md, so it has
-// to be first — it was missing from this chain, which meant a correctly-configured
-// deployment resolved to undefined and silently fell back to disk storage.
-const S3_BUCKET = process.env.S3_BUCKET ||
-                  process.env.CLOUD_STORAGE_BUCKET ||
-                  process.env.AWS_S3_BUCKET ||
-                  process.env.AWS_BUCKET_NAME ||
-                  process.env.AWS_STORAGE_BUCKET_NAME;
-
-// Must match dynamoStore.js's default. They disagreed (us-east-1 vs ap-south-1),
-// so S3 and DynamoDB could end up pointed at different regions when AWS_REGION
-// was unset — uploads landing in one region, records in another.
-const AWS_REGION = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || 'ap-south-1';
-
-const hasAwsCredentials = !!(
-  process.env.AWS_ACCESS_KEY_ID && 
-  !process.env.AWS_ACCESS_KEY_ID.includes('your_') &&
-  process.env.AWS_SECRET_ACCESS_KEY && 
-  !process.env.AWS_SECRET_ACCESS_KEY.includes('your_') &&
-  S3_BUCKET
-);
-
-const s3 = new S3Client({
-  region: AWS_REGION,
-  credentials: hasAwsCredentials ? {
-    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
-  } : undefined
-});
-
-const storage = hasAwsCredentials
-  ? multerS3({
-      s3: s3,
-      bucket: S3_BUCKET,
-      metadata: (req, file, cb) => cb(null, { fieldName: file.fieldname }),
-      key: (req, file, cb) => cb(null, `documents/${Date.now()}-${file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_')}`)
-    })
-  : process.env.VERCEL
-    // Serverless has no writable disk outside /tmp, and /tmp does not survive
-    // between invocations. Buffer in memory so the upload at least reaches OCR
-    // instead of throwing EROFS deep inside multer.
-    ? multer.memoryStorage()
-    : multer.diskStorage({
-        destination: (req, file, cb) => cb(null, UPLOADS_DIR),
-        filename: (req, file, cb) => cb(null, `${Date.now()}-${file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_')}`)
-      });
+// ── File storage: disk locally, memory on Vercel (no writable FS outside /tmp)
+const storage = process.env.VERCEL
+  ? multer.memoryStorage()
+  : multer.diskStorage({
+      destination: (req, file, cb) => cb(null, UPLOADS_DIR),
+      filename: (req, file, cb) => cb(null, `${Date.now()}-${file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_')}`)
+    });
 
 const upload = multer({
   storage,
@@ -330,17 +283,12 @@ const getClientIp = (req) => {
 const AUTH_SECRET = process.env.AUTH_SECRET || process.env.CRON_SECRET || null;
 
 function derivedFallbackSecret() {
-  // These are identical across all instances of one deployment and differ between
-  // deployments, which is the property a signing key needs here. AWS credentials
-  // are included because they are always present in this app's configuration and
-  // are not guessable by a client; only a hash of them is ever held.
+  // Derive from stable, non-secret deployment identifiers so every instance
+  // of the same deployment agrees on the signing key.
   const material = [
     process.env.VERCEL_URL,
     process.env.VERCEL_PROJECT_PRODUCTION_URL,
     process.env.VERCEL_GIT_REPO_SLUG,
-    process.env.AWS_ACCESS_KEY_ID,
-    process.env.AWS_SECRET_ACCESS_KEY,
-    process.env.DYNAMO_TABLE,
     process.env.GEMINI_API_KEY
   ].filter(Boolean).join('|');
 
@@ -1373,17 +1321,8 @@ function generateDraftData(companyId, sectionKey = null) {
 // authenticated diagnostic would be useless exactly when it is needed. It reports
 // only whether each setting resolved — never a key, secret, or credential value.
 app.get('/api/health', async (req, res) => {
-  // Named `report`, not `storage` — the module already has a `storage` const
-  // holding the multer engine, and shadowing it here reads like a bug.
   const report = {
-    dynamoConfigured: dynamoEnabled,
-    dynamoReady: false,
-    table: process.env.DYNAMO_TABLE || 'ipo_pilot_data',
-    region: AWS_REGION,
-    s3BucketResolved: Boolean(S3_BUCKET),
-    s3Uploads: hasAwsCredentials,
-    awsKeyPresent: Boolean(process.env.AWS_ACCESS_KEY_ID),
-    awsSecretPresent: Boolean(process.env.AWS_SECRET_ACCESS_KEY),
+    storage: 'local',
     geminiKeyPresent: Boolean(GEMINI_API_KEY),
     geminiModel: GEMINI_MODEL,
     serverless: isServerless
@@ -1393,7 +1332,6 @@ app.get('/api/health', async (req, res) => {
   let error = null;
   try {
     await ensureHydrated();
-    report.dynamoReady = dynamoEnabled ? isDbReady() : false;
   } catch (err) {
     ok = false;
     error = { reason: err?.name || 'UnknownError', detail: err?.message || String(err) };
@@ -1711,9 +1649,9 @@ app.post('/api/intake/:companyId/prefill/apply', authenticateToken, (req, res) =
 // only way to exercise that path without deploying.
 const OCR_RUNS_INLINE = Boolean(process.env.VERCEL) || process.env.OCR_INLINE === '1';
 
-// The function's maxDuration is 60s (vercel.json). Leave headroom for the S3
-// read, the DynamoDB write, and the response itself, so a slow model cannot push
-// the whole request past the limit and get it killed with no response at all.
+// The function's maxDuration is 60s (vercel.json). Leave headroom for reading
+// the file and writing the response itself, so a slow model cannot push the
+// whole request past the limit and get it killed with no response at all.
 const OCR_BUDGET_MS = Number(process.env.GEMINI_OCR_BUDGET_MS || (OCR_RUNS_INLINE ? 40000 : 120000));
 const OCR_ATTEMPT_TIMEOUT_MS = Number(process.env.GEMINI_OCR_TIMEOUT_MS || (OCR_RUNS_INLINE ? 20000 : 45000));
 
@@ -1793,15 +1731,6 @@ Return ONLY valid JSON: { summary, products, services, industries_served, key_ca
 
 /** Reads the uploaded bytes back from wherever multer put them. */
 async function readDocumentBytes(source) {
-  // Use the resolved S3_BUCKET, not the raw CLOUD_STORAGE_BUCKET env var: a
-  // deployment configured with S3_BUCKET uploaded to S3 but then took the disk
-  // branch, found no file, and "failed" OCR with nothing to read.
-  if (source.s3Key && S3_BUCKET) {
-    const s3Response = await s3.send(new GetObjectCommand({ Bucket: S3_BUCKET, Key: source.s3Key }));
-    const chunks = [];
-    for await (const chunk of s3Response.Body) chunks.push(chunk);
-    return Buffer.concat(chunks);
-  }
   if (source.localPath && fs.existsSync(source.localPath)) return fs.readFileSync(source.localPath);
   if (source.buffer) return source.buffer;
   return null;
@@ -1998,13 +1927,7 @@ app.post('/api/documents/:companyId/upload', authenticateToken, (req, res) => {
     const superseded = existingDocs.filter(d => d.doc_type === doc_type);
     for (const old of superseded) {
       db.deleteDocument(old.id);
-      if ((old.s3_key || old.storage_type === 's3') && hasAwsCredentials && S3_BUCKET) {
-        try {
-          await s3.send(new DeleteObjectCommand({ Bucket: S3_BUCKET, Key: old.s3_key || `documents/${old.name}` }));
-        } catch (s3Err) {
-          console.warn(`[UPLOAD] replaced-doc S3 cleanup warning (${old.s3_key}):`, s3Err.message);
-        }
-      } else if (old.file_path) {
+      if (old.file_path) {
         try {
           if (fs.existsSync(old.file_path)) fs.unlinkSync(old.file_path);
         } catch (fileErr) {
@@ -2023,9 +1946,8 @@ app.post('/api/documents/:companyId/upload', authenticateToken, (req, res) => {
       ocr_text: null,
       uploaded_at: new Date().toISOString(),
       uploaded_by: req.user.email,
-      file_path: req.file.location || req.file.path, // multer-s3 uses .location
-      s3_key: req.file.key || null,
-      storage_type: req.file.key ? 's3' : 'local',
+      file_path: req.file.path || null,
+      storage_type: 'local',
       file_size: req.file.size,
       file_mime: req.file.mimetype,
       extracted_values: {},
@@ -2052,7 +1974,6 @@ app.post('/api/documents/:companyId/upload', authenticateToken, (req, res) => {
       : undefined;
 
     const source = {
-      s3Key: req.file.key || null,
       localPath: req.file.path || null,
       buffer: req.file.buffer || null,
       mimetype: req.file.mimetype,
@@ -2103,7 +2024,6 @@ app.post('/api/documents/:id/retry-ocr', authenticateToken, async (req, res) => 
   }
 
   const source = {
-    s3Key: doc.s3_key || null,
     localPath: doc.storage_type === 'local' ? doc.file_path : null,
     buffer: null,
     mimetype: doc.file_mime,
@@ -2144,7 +2064,7 @@ app.put('/api/documents/:id/confirm', authenticateToken, (req, res) => {
   res.json({ message: 'Document data confirmed.', document: doc });
 });
 
-// Route to fetch and stream file content directly from AWS S3 or local storage
+// Route to fetch and stream file content from local storage
 app.get('/api/documents/:id/file', authenticateToken, async (req, res) => {
   try {
     const allDocs = db.getDocuments();
@@ -2156,28 +2076,12 @@ app.get('/api/documents/:id/file', authenticateToken, async (req, res) => {
       return res.status(403).json({ message: 'Not authorized to view this document file.' });
     }
 
-    // Stream from AWS S3 if s3_key exists and AWS is configured
-    if ((doc.s3_key || doc.storage_type === 's3') && hasAwsCredentials && S3_BUCKET) {
-      try {
-        const getObjCmd = new GetObjectCommand({
-          Bucket: S3_BUCKET,
-          Key: doc.s3_key || `documents/${doc.name}`
-        });
-        const s3Response = await s3.send(getObjCmd);
-        res.setHeader('Content-Type', s3Response.ContentType || doc.file_mime || 'application/pdf');
-        res.setHeader('Content-Disposition', `inline; filename="${doc.name}"`);
-        return s3Response.Body.pipe(res);
-      } catch (s3Err) {
-        console.warn(`[S3 Stream Error] Failed to stream from S3 (${doc.s3_key}):`, s3Err.message);
-      }
-    }
-
-    // Fallback to local file if available
+    // Serve from local disk
     if (doc.file_path && fs.existsSync(doc.file_path)) {
       return res.sendFile(path.resolve(doc.file_path));
     }
 
-    res.status(404).json({ message: 'Source file not available on S3 bucket or local storage.' });
+    res.status(404).json({ message: 'Source file not available. File may not have been saved to disk.' });
   } catch (err) {
     console.error('[Document File] Error:', err.message);
     res.status(500).json({ message: 'Server error retrieving file.' });
@@ -2201,20 +2105,8 @@ app.delete('/api/documents/:id', authenticateToken, async (req, res) => {
     // Remove from DB
     db.deleteDocument(req.params.id);
 
-    // Remove physical file or S3 object from cloud
-    if ((doc.s3_key || doc.storage_type === 's3') && hasAwsCredentials && S3_BUCKET) {
-      try {
-        const s3Key = doc.s3_key || `documents/${doc.name}`;
-        const deleteCmd = new DeleteObjectCommand({
-          Bucket: S3_BUCKET,
-          Key: s3Key
-        });
-        await s3.send(deleteCmd);
-        console.log(`[DELETE] Successfully deleted object from AWS S3 Cloud: ${s3Key}`);
-      } catch (s3Err) {
-        console.warn(`[DELETE] S3 object removal warning (${doc.s3_key}):`, s3Err.message);
-      }
-    } else if (doc.file_path) {
+    // Remove physical file from disk
+    if (doc.file_path) {
       try {
         if (fs.existsSync(doc.file_path)) {
           fs.unlinkSync(doc.file_path);
@@ -3380,14 +3272,13 @@ function ensureHydrated() {
 }
 
 if (!isServerless) {
-  // Hydrate the DynamoDB-backed store before accepting traffic, so the first request
-  // never races an empty in-memory store.
+  // Initialise local db then start listening.
   ensureHydrated()
-    .then((usingDynamo) => {
+    .then(() => {
       try { generateDraftData('aarav-precision'); } catch (e) {}
       app.listen(PORT, () => {
         console.log(`IPO Pilot AI backend running on http://localhost:${PORT}`);
-        console.log(`Storage: ${usingDynamo ? 'DynamoDB (live)' : 'local db.json'}`);
+        console.log('Storage: local db.json');
         console.log(`Gemini model: ${GEMINI_MODEL}`);
       });
     })
@@ -3397,35 +3288,20 @@ if (!isServerless) {
     });
 }
 
-// Vercel imports this module and invokes the default export per request. Waiting
-// on ensureHydrated() here (rather than at import time) means a cold start that
-// fails to reach DynamoDB returns 503 instead of serving an empty store.
+// Vercel imports this module and invokes the default export per request.
 export default async function handler(req, res) {
   try {
     await ensureHydrated();
-    // ensureHydrated() only does its real work (the DynamoDB Scan) once per
-    // container — every request after the first on a warm container used to
-    // skip straight past it and serve that container's original snapshot, no
-    // matter how much other containers had written since. A document uploaded
-    // via one container could be invisible to every other already-warm
-    // container for as long as they stayed warm — which on Vercel can be
-    // minutes. refreshDb() re-syncs from DynamoDB on every request so any
-    // container reflects what every other container has written.
-    await refreshDb();
     try { generateDraftData('aarav-precision'); } catch (e) {}
   } catch (err) {
     console.error('Storage init failed:', err);
     res.statusCode = 503;
     res.setHeader('Content-Type', 'application/json');
-    // The bare "Storage unavailable" message left no way to tell a missing table
-    // from a bad region from a denied IAM policy without digging through Vercel's
-    // function logs. AWS error names/codes are classifications, not secrets, so
-    // returning them is safe and turns a dead end into an actionable message.
     return res.end(JSON.stringify({
       message: 'Storage unavailable. Please retry.',
       reason: err?.name || 'UnknownError',
       detail: err?.message || String(err),
-      hint: 'Check /api/health for which storage settings resolved.'
+      hint: 'Check /api/health for details.'
     }));
   }
   return app(req, res);

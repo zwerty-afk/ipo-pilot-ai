@@ -2,15 +2,6 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
-import {
-  dynamoEnabled,
-  initStore,
-  isReady,
-  readStore,
-  writeStore,
-  flushStore as flushDynamoStore,
-  refreshStore
-} from './dynamoStore.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -685,18 +676,19 @@ const INITIAL_SEED = {
   verifications: []
 };
 
-export function getDb() {
-  // When DynamoDB is active, serve from the in-memory copy loaded at boot.
-  if (dynamoEnabled && isReady()) {
-    return readStore();
-  }
+// ── In-memory cache for Vercel (read-only FS): seed is loaded once per cold start.
+let _vercelMemStore = null;
 
-  // Read-only deployment: never try to materialise db.json. Reaching here means
-  // DynamoDB is unavailable, so return the seed in memory rather than throwing an
-  // EROFS that would hide the real storage error.
+export function getDb() {
+  // Vercel serverless: filesystem is read-only outside /tmp.
+  // Serve from an in-memory copy seeded on first access; writes go to the same
+  // in-memory object so changes survive within a single warm container invocation
+  // but will not persist across cold starts.
   if (process.env.VERCEL) {
-    console.warn('[db] DynamoDB unavailable under serverless — serving in-memory seed (changes will not persist)');
-    return JSON.parse(JSON.stringify(INITIAL_SEED));
+    if (!_vercelMemStore) {
+      _vercelMemStore = JSON.parse(JSON.stringify(INITIAL_SEED));
+    }
+    return _vercelMemStore;
   }
 
   if (!fs.existsSync(DB_FILE)) {
@@ -734,48 +726,26 @@ export function getDb() {
 }
 
 export function saveDb(data) {
-  if (dynamoEnabled && isReady()) {
-    writeStore(data);
-    return;
-  }
+  // Vercel: write back to the in-memory store so reads within the same
+  // invocation see the update, even though it won't survive a cold start.
   if (process.env.VERCEL) {
-    // Nothing durable to write to. Log loudly rather than crashing the request:
-    // a silent no-op here would look like a successful save.
-    console.error('[db] save dropped — DynamoDB not ready and filesystem is read-only');
+    _vercelMemStore = data;
     return;
   }
   fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
 }
 
-/** Called once at server boot to hydrate the DynamoDB-backed store. */
+/** No-op — local file storage needs no async initialisation. */
 export async function initDb() {
-  if (!dynamoEnabled) {
-    console.log('[db] DynamoDB disabled — using local db.json');
-    return false;
-  }
-  await initStore(INITIAL_SEED);
-  return true;
+  console.log('[db] Using local db.json storage');
+  return false;
 }
 
-/**
- * Awaits any pending DynamoDB writes. On a long-lived server writes are coalesced
- * and this is only needed for tests/shutdown, but under serverless the request
- * must await it before responding or a frozen container drops the write.
- */
-export async function flushDb() {
-  if (!dynamoEnabled || !isReady()) return;
-  await flushDynamoStore();
-}
+/** No-op — no pending async writes with local file storage. */
+export async function flushDb() {}
 
-/**
- * Re-syncs the in-memory store from DynamoDB. Call before serving a request
- * on serverless — see refreshStore() in dynamoStore.js for why a warm
- * container cannot be trusted to already have what other containers wrote.
- */
-export async function refreshDb() {
-  if (!dynamoEnabled || !isReady()) return;
-  await refreshStore();
-}
+/** No-op — no remote store to re-sync from. */
+export async function refreshDb() {}
 
 export const db = {
   getUsers: () => getDb().users,
